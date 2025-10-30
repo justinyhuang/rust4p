@@ -81,10 +81,10 @@ fn cmd_opened() -> Result<()> {
         let lines: Vec<String> = files.iter().map(render_opened_line).collect_vec();
         
         let box_width = std::cmp::max(
-            unicode_width::UnicodeWidthStr::width(header.as_str()),
+            visual_width(&header),
             lines
                 .iter()
-                .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()))
+                .map(|s| visual_width(s))
                 .max()
                 .unwrap_or(0),
         ) + 4;
@@ -113,10 +113,32 @@ fn cmd_opened() -> Result<()> {
 }
 
 
+fn action_emoji(action: &str) -> &str {
+    match action {
+        "edit" => "✏️",
+        "add" => "➕",
+        "delete" => "🗑️",
+        "integrate" => "🔀",
+        "branch" => "🌿",
+        "move/add" => "📦",
+        "move/delete" => "📤",
+        _ => "📄",
+    }
+}
+
 fn render_opened_line(f: &perforce::OpenedFile) -> String {
     let rev = f.workrev.as_deref().unwrap_or("-");
-    format!("{:<8} {:<6} {:>4}  {}",
-        f.action, "rev", rev, f.depot_file)
+    let emoji = action_emoji(&f.action);
+    // Manually format to ensure proper alignment despite emoji width variations
+    format!("{} {:<10} {:<6} {:<4} {}",
+        emoji, f.action, "rev", rev, f.depot_file)
+}
+
+fn visual_width(s: &str) -> usize {
+    // Strip ANSI escape codes for accurate width calculation
+    let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+    let stripped = ansi_re.replace_all(s, "");
+    unicode_width::UnicodeWidthStr::width(stripped.as_ref())
 }
 
 fn print_box<F>(title: &str, lines: &[String], colorize: F, width: usize, skip_top: bool, is_last: bool)
@@ -134,12 +156,16 @@ where
     } else {
         println!("{}", colorize(&top));
     }
+    // Make title bold
+    let bold_title = format!("\x1b[1m{}\x1b[0m", title);
+    let title_visual_width = visual_width(&bold_title);
+    let title_pad = width - 2 - title_visual_width;
     println!(
         "{}",
-        colorize(&format!("{v} {:<w$} {v}", title, w = width - 2))
+        colorize(&format!("{v} {}{:pad$} {v}", bold_title, "", pad = title_pad))
     );
     for l in lines {
-        let pad = width - 2 - unicode_width::UnicodeWidthStr::width(l.as_str());
+        let pad = width - 2 - visual_width(l);
         println!("{}", colorize(&format!("{v} {}{:pad$} {v}", l, "", pad = pad)));
     }
     if is_last {
