@@ -112,8 +112,15 @@ fn cmd_opened() -> Result<()> {
     let num_keys = keys.len();
     for (idx, key) in keys.iter().enumerate() {
         let files = map.get(key).unwrap();
-        let color = palette[palette_idx % palette.len()];
-        palette_idx += 1;
+        // Default changelist is always bright red
+        let color = if key == "default" {
+            |s: &str| s.bright_red().to_string()
+        } else {
+            palette[palette_idx % palette.len()]
+        };
+        if key != "default" {
+            palette_idx += 1;
+        }
 
         let title = if key == "default" {
             "CL default (pending)".to_string()
@@ -223,12 +230,23 @@ fn cmd_reopen() -> Result<()> {
         |s| s.bright_yellow().to_string(),
     ];
     
-    // Map CL to color
+    let bright_red_fn: fn(&str) -> String = |s| s.bright_red().to_string();
+    
+    // Map CL to color - default is always bright red
     let cl_to_color: HashMap<String, fn(&str) -> String> = cls
         .iter()
         .enumerate()
-        .map(|(idx, cl)| (cl.clone(), palette[idx % palette.len()]))
+        .map(|(idx, cl)| {
+            if cl == "default" {
+                (cl.clone(), bright_red_fn)
+            } else {
+                (cl.clone(), palette[idx % palette.len()])
+            }
+        })
         .collect();
+    
+    // Print newline to establish starting position
+    println!();
     
     // Interactive file selector
     let selected_files = interactive_file_select(&opened, &cl_to_color)?;
@@ -388,12 +406,23 @@ fn cmd_revert() -> Result<()> {
         |s| s.bright_yellow().to_string(),
     ];
     
-    // Map CL to color
+    let bright_red_fn: fn(&str) -> String = |s| s.bright_red().to_string();
+    
+    // Map CL to color - default is always bright red
     let cl_to_color: HashMap<String, fn(&str) -> String> = cls
         .iter()
         .enumerate()
-        .map(|(idx, cl)| (cl.clone(), palette[idx % palette.len()]))
+        .map(|(idx, cl)| {
+            if cl == "default" {
+                (cl.clone(), bright_red_fn)
+            } else {
+                (cl.clone(), palette[idx % palette.len()])
+            }
+        })
         .collect();
+    
+    // Print newline to establish starting position
+    println!();
     
     // Interactive file selector
     let selected_files = interactive_file_select(&opened, &cl_to_color)?;
