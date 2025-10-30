@@ -87,6 +87,17 @@ fn cmd_opened() -> Result<()> {
         |s| s.bright_yellow().to_string(),
     ];
 
+    // Fetch descriptions for each CL
+    let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    for key in &keys {
+        if key != "default" {
+            if let Ok(Some(desc)) = perforce::get_change_description(key) {
+                let first_line = desc.lines().next().unwrap_or("").trim();
+                cl_descriptions.insert(key.clone(), first_line.to_string());
+            }
+        }
+    }
+
     // Calculate max width across all boxes first
     let mut max_width = 0usize;
     for key in &keys {
@@ -99,8 +110,16 @@ fn cmd_opened() -> Result<()> {
         let header = format!(" {} — {} file(s) ", title, files.len());
         let lines: Vec<String> = files.iter().map(render_opened_line).collect_vec();
         
+        // Include description in width calculation
+        let desc = cl_descriptions.get(key).map(|s| s.as_str()).unwrap_or("");
+        let desc_width = if !desc.is_empty() {
+            visual_width(&format!(" {}", desc))
+        } else {
+            0
+        };
+        
         let box_width = std::cmp::max(
-            visual_width(&header),
+            std::cmp::max(visual_width(&header), desc_width),
             lines
                 .iter()
                 .map(|s| visual_width(s))
@@ -131,8 +150,9 @@ fn cmd_opened() -> Result<()> {
             format!("CL {key}")
         };
         let header = format!(" {} — {} file(s) ", title, files.len());
+        let description = cl_descriptions.get(key).map(|s| s.as_str()).unwrap_or("");
         let is_last = idx == num_keys - 1;
-        print_box(&header, &files.iter().map(render_opened_line).collect_vec(), color, max_width, idx > 0, is_last);
+        print_box(&header, description, &files.iter().map(render_opened_line).collect_vec(), color, max_width, idx > 0, is_last);
     }
 
     Ok(())
@@ -892,7 +912,7 @@ fn visual_width(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(stripped.as_ref())
 }
 
-fn print_box<F>(title: &str, lines: &[String], colorize: F, width: usize, skip_top: bool, is_last: bool)
+fn print_box<F>(title: &str, description: &str, lines: &[String], colorize: F, width: usize, skip_top: bool, is_last: bool)
 where
     F: Fn(&str) -> String + Copy,
 {
@@ -915,6 +935,16 @@ where
         "{}",
         colorize(&format!("{v} {}{:pad$} {v}", bold_title, "", pad = title_pad))
     );
+    
+    // Print description if provided
+    if !description.is_empty() {
+        let desc_pad = width - 2 - visual_width(description);
+        println!(
+            "{}",
+            colorize(&format!("{v} {}{:pad$} {v}", description, "", pad = desc_pad))
+        );
+    }
+    
     for l in lines {
         let pad = width - 2 - visual_width(l);
         println!("{}", colorize(&format!("{v} {}{:pad$} {v}", l, "", pad = pad)));
