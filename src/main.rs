@@ -29,6 +29,8 @@ enum Commands {
     Change,
     /// Interactive file selector to reopen files to a different changelist.
     Reopen,
+    /// Interactive file selector to revert files.
+    Revert,
 }
 
 fn main() -> Result<()> {
@@ -38,6 +40,7 @@ fn main() -> Result<()> {
         Commands::Opened => cmd_opened()?,
         Commands::Change => cmd_change()?,
         Commands::Reopen => cmd_reopen()?,
+        Commands::Revert => cmd_revert()?,
     }
     Ok(())
 }
@@ -340,6 +343,102 @@ fn cmd_reopen() -> Result<()> {
     Ok(())
 }
 
+fn cmd_revert() -> Result<()> {
+    let mut opened = perforce::get_opened_files()?;
+    
+    if opened.is_empty() {
+        println!("No open files found.");
+        return Ok(());
+    }
+    
+    // Sort files by changelist to group them together
+    opened.sort_by(|a, b| {
+        if a.changelist == "default" && b.changelist != "default" {
+            std::cmp::Ordering::Less
+        } else if b.changelist == "default" && a.changelist != "default" {
+            std::cmp::Ordering::Greater
+        } else {
+            match (a.changelist.parse::<i64>(), b.changelist.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.changelist.cmp(&b.changelist),
+            }
+        }
+    });
+    
+    // Get unique CLs for color mapping (in sorted order)
+    let mut cls: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for file in &opened {
+        if seen.insert(file.changelist.clone()) {
+            cls.push(file.changelist.clone());
+        }
+    }
+    
+    // Color palette
+    let palette: Vec<fn(&str) -> String> = vec![
+        |s| s.blue().to_string(),
+        |s| s.green().to_string(),
+        |s| s.magenta().to_string(),
+        |s| s.cyan().to_string(),
+        |s| s.yellow().to_string(),
+        |s| s.bright_blue().to_string(),
+        |s| s.bright_green().to_string(),
+        |s| s.bright_magenta().to_string(),
+        |s| s.bright_cyan().to_string(),
+        |s| s.bright_yellow().to_string(),
+    ];
+    
+    // Map CL to color
+    let cl_to_color: HashMap<String, fn(&str) -> String> = cls
+        .iter()
+        .enumerate()
+        .map(|(idx, cl)| (cl.clone(), palette[idx % palette.len()]))
+        .collect();
+    
+    // Interactive file selector
+    let selected_files = interactive_file_select(&opened, &cl_to_color)?;
+    
+    if selected_files.is_empty() {
+        println!("No files selected.");
+        return Ok(());
+    }
+    
+    // Confirmation prompt
+    println!("\nYou are about to revert {} file(s):", selected_files.len());
+    for file in &selected_files {
+        println!("  - {}", file.depot_file);
+    }
+    println!("\nThis will discard all changes. Are you sure? (yes/no):");
+    
+    let mut confirm = String::new();
+    std::io::stdin().read_line(&mut confirm)?;
+    
+    if confirm.trim().to_lowercase() != "yes" {
+        println!("Cancelled.");
+        return Ok(());
+    }
+    
+    // Execute p4 revert for each selected file
+    println!("\nReverting {} file(s)...", selected_files.len());
+    
+    for file in &selected_files {
+        let mut cmd = std::process::Command::new("p4");
+        cmd.arg("revert").arg(&file.depot_file);
+        
+        let output = cmd.output()?;
+        if !output.status.success() {
+            eprintln!("Failed to revert {}: {}", file.depot_file, 
+                String::from_utf8_lossy(&output.stderr));
+        } else {
+            println!("✓ {}", file.depot_file);
+        }
+    }
+    
+    println!("\nDone!");
+    
+    Ok(())
+}
+
 fn interactive_file_select(
     files: &[perforce::OpenedFile],
     cl_to_color: &HashMap<String, fn(&str) -> String>,
@@ -350,41 +449,23 @@ fn interactive_file_select(
     // Get current cursor position
     let start_pos = cursor::position()?;
     
-    // Enable raw mode and hide cursor
+    // Enable raw mode
     terminal::enable_raw_mode()?;
-    execute!(std::io::stdout(), cursor::Hide)?;
     
     let result = (|| -> Result<Vec<perforce::OpenedFile>> {
-        let mut first_draw = true;
-        
         loop {
-            let mut current_row = start_pos.1;
+            // Move cursor to start position and clear from here down
+            execute!(
+                std::io::stdout(),
+                cursor::MoveTo(start_pos.0, start_pos.1),
+                terminal::Clear(ClearType::FromCursorDown)
+            )?;
             
             // Display header
-            execute!(
-                std::io::stdout(),
-                cursor::MoveTo(start_pos.0, current_row),
-                terminal::Clear(ClearType::CurrentLine)
-            )?;
-            print!("Select files (↑/↓ to navigate, Space to toggle, Enter to confirm, Esc/q to cancel):");
-            current_row += 1;
-            
-            // Empty line
-            execute!(
-                std::io::stdout(),
-                cursor::MoveTo(start_pos.0, current_row),
-                terminal::Clear(ClearType::CurrentLine)
-            )?;
-            current_row += 1;
+            print!("Select files (↑/↓ to navigate, Space to toggle, Enter to confirm, Esc/q to cancel):\r\n\r\n");
             
             // Display files
             for (idx, file) in files.iter().enumerate() {
-                execute!(
-                    std::io::stdout(),
-                    cursor::MoveTo(start_pos.0, current_row),
-                    terminal::Clear(ClearType::CurrentLine)
-                )?;
-                
                 let color = cl_to_color.get(&file.changelist).unwrap();
                 let cl_label = if file.changelist == "default" {
                     "default".to_string()
@@ -399,39 +480,14 @@ fn interactive_file_select(
                     arrow, checkbox, cl_label, file.depot_file);
                 
                 if idx == selected_idx {
-                    print!("{}", color(&line).bold().to_string());
+                    print!("{}\r\n", color(&line).bold().to_string());
                 } else {
-                    print!("{}", color(&line));
+                    print!("{}\r\n", color(&line));
                 }
-                current_row += 1;
             }
             
-            // Empty line
-            execute!(
-                std::io::stdout(),
-                cursor::MoveTo(start_pos.0, current_row),
-                terminal::Clear(ClearType::CurrentLine)
-            )?;
-            current_row += 1;
-            
-            // Selected count
-            execute!(
-                std::io::stdout(),
-                cursor::MoveTo(start_pos.0, current_row),
-                terminal::Clear(ClearType::CurrentLine)
-            )?;
-            print!("Selected: {} file(s)", selected_set.len());
-            current_row += 1;
-            
-            // Clear any remaining lines on first draw
-            if first_draw {
-                execute!(
-                    std::io::stdout(),
-                    cursor::MoveTo(start_pos.0, current_row),
-                    terminal::Clear(ClearType::FromCursorDown)
-                )?;
-                first_draw = false;
-            }
+            print!("\r\n");
+            print!("Selected: {} file(s)\r\n", selected_set.len());
             
             std::io::stdout().flush()?;
             
@@ -457,7 +513,6 @@ fn interactive_file_select(
                     }
                     KeyCode::Enter => {
                         terminal::disable_raw_mode()?;
-                        execute!(std::io::stdout(), cursor::Show)?;
                         // Clear the menu
                         execute!(
                             std::io::stdout(),
@@ -473,7 +528,6 @@ fn interactive_file_select(
                     }
                     KeyCode::Esc | KeyCode::Char('q') => {
                         terminal::disable_raw_mode()?;
-                        execute!(std::io::stdout(), cursor::Show)?;
                         // Clear the menu
                         execute!(
                             std::io::stdout(),
@@ -489,9 +543,8 @@ fn interactive_file_select(
         }
     })();
     
-    // Always disable raw mode and show cursor on exit
+    // Always disable raw mode on exit
     terminal::disable_raw_mode()?;
-    execute!(std::io::stdout(), cursor::Show)?;
     
     result
 }
