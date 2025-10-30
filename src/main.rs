@@ -5,6 +5,13 @@ use clap::{Parser, Subcommand};
 use itertools::Itertools;
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
+use std::io::Write;
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode, KeyEvent},
+    execute,
+    terminal::{self, ClearType},
+};
 
 /// p — tiny Perforce helper CLI
 #[derive(Parser)]
@@ -18,6 +25,8 @@ struct Cli {
 enum Commands {
     /// Show opened files grouped by changelist, with colored boxes.
     Opened,
+    /// Interactive changelist selector for editing with p4 change.
+    Change,
 }
 
 fn main() -> Result<()> {
@@ -25,6 +34,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Opened => cmd_opened()?,
+        Commands::Change => cmd_change()?,
     }
     Ok(())
 }
@@ -110,6 +120,146 @@ fn cmd_opened() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_change() -> Result<()> {
+    let opened = perforce::get_opened_files()?;
+    
+    // Group by changelist to get unique CLs
+    let mut cls: Vec<String> = opened
+        .iter()
+        .map(|f| f.changelist.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    
+    // Sort: default first, then numeric
+    cls.sort_by(|a, b| {
+        if a == "default" && b != "default" {
+            std::cmp::Ordering::Less
+        } else if b == "default" && a != "default" {
+            std::cmp::Ordering::Greater
+        } else {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            }
+        }
+    });
+    
+    if cls.is_empty() {
+        println!("No open changelists found.");
+        return Ok(());
+    }
+    
+    // Run interactive selector
+    let selected = interactive_select(&cls)?;
+    
+    if let Some(cl) = selected {
+        // Execute p4 change <CL>
+        let mut cmd = std::process::Command::new("p4");
+        cmd.arg("change").arg(&cl);
+        cmd.stdin(std::process::Stdio::inherit());
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
+        
+        let status = cmd.status()?;
+        if !status.success() {
+            anyhow::bail!("p4 change command failed");
+        }
+    }
+    
+    Ok(())
+}
+
+fn interactive_select(items: &[String]) -> Result<Option<String>> {
+    let mut selected_idx = 0usize;
+    
+    // Get current cursor position
+    let start_pos = cursor::position()?;
+    
+    // Enable raw mode
+    terminal::enable_raw_mode()?;
+    
+    let result = (|| -> Result<Option<String>> {
+        loop {
+            // Move cursor to start position and clear from here down
+            execute!(
+                std::io::stdout(),
+                cursor::MoveTo(start_pos.0, start_pos.1),
+                terminal::Clear(ClearType::FromCursorDown)
+            )?;
+            
+            // Display header
+            print!("Select a changelist (↑/↓ to navigate, Enter to edit, Esc/q to cancel):\r\n\r\n");
+            
+            // Display items
+            for (idx, item) in items.iter().enumerate() {
+                let display = if item == "default" {
+                    "CL default (pending)".to_string()
+                } else {
+                    format!("CL {}", item)
+                };
+                
+                if idx == selected_idx {
+                    print!("  {}  {}\r\n", "→".bright_green(), display.bright_green().bold());
+                } else {
+                    print!("     {}\r\n", display);
+                }
+            }
+            
+            std::io::stdout().flush()?;
+            
+            // Read key event
+            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                match code {
+                    KeyCode::Up => {
+                        if selected_idx > 0 {
+                            selected_idx -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if selected_idx < items.len() - 1 {
+                            selected_idx += 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let result = items[selected_idx].clone();
+                        terminal::disable_raw_mode()?;
+                        // Clear the menu and print final selection
+                        execute!(
+                            std::io::stdout(),
+                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            terminal::Clear(ClearType::FromCursorDown)
+                        )?;
+                        println!("Selected: {}", if result == "default" {
+                            "CL default (pending)".to_string()
+                        } else {
+                            format!("CL {}", result)
+                        });
+                        return Ok(Some(result));
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        terminal::disable_raw_mode()?;
+                        // Clear the menu
+                        execute!(
+                            std::io::stdout(),
+                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            terminal::Clear(ClearType::FromCursorDown)
+                        )?;
+                        println!("Cancelled.");
+                        return Ok(None);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })();
+    
+    // Always disable raw mode on exit
+    terminal::disable_raw_mode()?;
+    
+    result
 }
 
 
