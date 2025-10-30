@@ -31,6 +31,8 @@ enum Commands {
     Reopen,
     /// Interactive file selector to revert files.
     Revert,
+    /// Unshelve files from a changelist.
+    Unshelve,
 }
 
 fn main() -> Result<()> {
@@ -41,6 +43,7 @@ fn main() -> Result<()> {
         Commands::Change => cmd_change()?,
         Commands::Reopen => cmd_reopen()?,
         Commands::Revert => cmd_revert()?,
+        Commands::Unshelve => cmd_unshelve()?,
     }
     Ok(())
 }
@@ -476,6 +479,87 @@ fn cmd_revert() -> Result<()> {
     }
     
     println!("\nDone!");
+    
+    Ok(())
+}
+
+fn cmd_unshelve() -> Result<()> {
+    println!("Enter CL number to unshelve:");
+    
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let cl_number = input.trim();
+    
+    if cl_number.is_empty() {
+        println!("Error: No CL number provided");
+        return Ok(());
+    }
+    
+    // Validate it's a number
+    if cl_number.parse::<i64>().is_err() {
+        println!("Error: Invalid CL number '{}'", cl_number);
+        return Ok(());
+    }
+    
+    // Check if CL exists and get description
+    match perforce::get_change_description(cl_number)? {
+        None => {
+            println!("Error: CL {} does not exist", cl_number);
+            return Ok(());
+        }
+        Some(desc) => {
+            println!("\nCL {} found:", cl_number);
+            let first_line = desc.lines().next().unwrap_or("(no description)");
+            println!("Description: {}", first_line);
+        }
+    }
+    
+    // Unshelve the files
+    println!("\nUnshelving CL {}...", cl_number);
+    match perforce::unshelve_changelist(cl_number) {
+        Ok(_) => {
+            println!("✓ Successfully unshelved files from CL {}", cl_number);
+        }
+        Err(e) => {
+            eprintln!("Error unshelving: {}", e);
+            return Err(e);
+        }
+    }
+    
+    // Reopen files to the same CL
+    println!("\nReopening unshelved files to CL {}...", cl_number);
+    
+    // Get all opened files
+    let opened = perforce::get_opened_files()?;
+    
+    // Filter files that are in the default changelist (just unshelved)
+    let default_files: Vec<_> = opened
+        .iter()
+        .filter(|f| f.changelist == "default")
+        .collect();
+    
+    if default_files.is_empty() {
+        println!("No files found in default changelist to reopen");
+        return Ok(());
+    }
+    
+    println!("Reopening {} file(s) to CL {}...", default_files.len(), cl_number);
+    
+    for file in default_files {
+        let mut cmd = std::process::Command::new("p4");
+        cmd.arg("reopen").arg("-c").arg(cl_number).arg(&file.depot_file);
+        
+        let output = cmd.output()?;
+        if !output.status.success() {
+            eprintln!("Warning: Failed to reopen {}: {}", 
+                file.depot_file, 
+                String::from_utf8_lossy(&output.stderr));
+        } else {
+            println!("✓ {}", file.depot_file);
+        }
+    }
+    
+    println!("\nDone! CL {} is ready for use.", cl_number);
     
     Ok(())
 }
