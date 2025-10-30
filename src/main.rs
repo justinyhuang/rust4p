@@ -27,6 +27,8 @@ enum Commands {
     Opened,
     /// Interactive changelist selector for editing with p4 change.
     Change,
+    /// Interactive file selector to reopen files to a different changelist.
+    Reopen,
 }
 
 fn main() -> Result<()> {
@@ -35,6 +37,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Opened => cmd_opened()?,
         Commands::Change => cmd_change()?,
+        Commands::Reopen => cmd_reopen()?,
     }
     Ok(())
 }
@@ -172,6 +175,327 @@ fn cmd_change() -> Result<()> {
     Ok(())
 }
 
+fn cmd_reopen() -> Result<()> {
+    let mut opened = perforce::get_opened_files()?;
+    
+    if opened.is_empty() {
+        println!("No open files found.");
+        return Ok(());
+    }
+    
+    // Sort files by changelist to group them together
+    opened.sort_by(|a, b| {
+        if a.changelist == "default" && b.changelist != "default" {
+            std::cmp::Ordering::Less
+        } else if b.changelist == "default" && a.changelist != "default" {
+            std::cmp::Ordering::Greater
+        } else {
+            match (a.changelist.parse::<i64>(), b.changelist.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.changelist.cmp(&b.changelist),
+            }
+        }
+    });
+    
+    // Get unique CLs for color mapping (in sorted order)
+    let mut cls: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for file in &opened {
+        if seen.insert(file.changelist.clone()) {
+            cls.push(file.changelist.clone());
+        }
+    }
+    
+    // Color palette
+    let palette: Vec<fn(&str) -> String> = vec![
+        |s| s.blue().to_string(),
+        |s| s.green().to_string(),
+        |s| s.magenta().to_string(),
+        |s| s.cyan().to_string(),
+        |s| s.yellow().to_string(),
+        |s| s.bright_blue().to_string(),
+        |s| s.bright_green().to_string(),
+        |s| s.bright_magenta().to_string(),
+        |s| s.bright_cyan().to_string(),
+        |s| s.bright_yellow().to_string(),
+    ];
+    
+    // Map CL to color
+    let cl_to_color: HashMap<String, fn(&str) -> String> = cls
+        .iter()
+        .enumerate()
+        .map(|(idx, cl)| (cl.clone(), palette[idx % palette.len()]))
+        .collect();
+    
+    // Interactive file selector
+    let selected_files = interactive_file_select(&opened, &cl_to_color)?;
+    
+    if selected_files.is_empty() {
+        println!("No files selected.");
+        return Ok(());
+    }
+    
+    // Get unique CLs for destination selection
+    let mut dest_cls: Vec<String> = opened
+        .iter()
+        .map(|f| f.changelist.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    
+    // Sort CLs
+    dest_cls.sort_by(|a, b| {
+        if a == "default" && b != "default" {
+            std::cmp::Ordering::Less
+        } else if b == "default" && a != "default" {
+            std::cmp::Ordering::Greater
+        } else {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            }
+        }
+    });
+    
+    // Add "new CL" option at the end
+    dest_cls.push("new".to_string());
+    
+    // Show CL selector
+    println!("\nSelect destination changelist:");
+    let dest_cl = interactive_select(&dest_cls)?;
+    
+    if let Some(cl) = dest_cl {
+        let final_cl = if cl == "new" {
+            // Handle new CL flow
+            println!("\nEnter CL number (or press Enter to create new CL):");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let input = input.trim();
+            
+            if input.is_empty() {
+                // Create new CL
+                println!("Creating new changelist...");
+                let new_cl = perforce::create_changelist()?;
+                println!("Created CL {}", new_cl);
+                new_cl
+            } else {
+                // Check if CL exists
+                match perforce::get_change_description(input)? {
+                    Some(desc) => {
+                        println!("\nCL {} exists:", input);
+                        println!("Description: {}", desc);
+                        println!("\nConfirm unshelving and adding files to this CL? (y/n):");
+                        
+                        let mut confirm = String::new();
+                        std::io::stdin().read_line(&mut confirm)?;
+                        
+                        if confirm.trim().to_lowercase() != "y" {
+                            println!("Cancelled.");
+                            return Ok(());
+                        }
+                        
+                        // Unshelve the CL
+                        println!("Unshelving CL {}...", input);
+                        if let Err(e) = perforce::unshelve_changelist(input) {
+                            eprintln!("Warning: Could not unshelve: {}", e);
+                            println!("Continuing to reopen files...");
+                        }
+                        
+                        input.to_string()
+                    }
+                    None => {
+                        println!("Error: CL {} does not exist", input);
+                        return Ok(());
+                    }
+                }
+            }
+        } else {
+            cl
+        };
+        
+        // Execute p4 reopen for each selected file
+        println!("\nReopening {} file(s) to {}...", selected_files.len(), 
+            if final_cl == "default" { "default changelist".to_string() } else { format!("CL {}", final_cl) });
+        
+        for file in &selected_files {
+            let mut cmd = std::process::Command::new("p4");
+            if final_cl == "default" {
+                cmd.arg("reopen").arg("-c").arg("default").arg(&file.depot_file);
+            } else {
+                cmd.arg("reopen").arg("-c").arg(&final_cl).arg(&file.depot_file);
+            }
+            
+            let output = cmd.output()?;
+            if !output.status.success() {
+                eprintln!("Failed to reopen {}: {}", file.depot_file, 
+                    String::from_utf8_lossy(&output.stderr));
+            } else {
+                println!("✓ {}", file.depot_file);
+            }
+        }
+        
+        println!("\nDone!");
+    }
+    
+    Ok(())
+}
+
+fn interactive_file_select(
+    files: &[perforce::OpenedFile],
+    cl_to_color: &HashMap<String, fn(&str) -> String>,
+) -> Result<Vec<perforce::OpenedFile>> {
+    let mut selected_idx = 0usize;
+    let mut selected_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    
+    // Get current cursor position
+    let start_pos = cursor::position()?;
+    
+    // Enable raw mode and hide cursor
+    terminal::enable_raw_mode()?;
+    execute!(std::io::stdout(), cursor::Hide)?;
+    
+    let result = (|| -> Result<Vec<perforce::OpenedFile>> {
+        let mut first_draw = true;
+        
+        loop {
+            let mut current_row = start_pos.1;
+            
+            // Display header
+            execute!(
+                std::io::stdout(),
+                cursor::MoveTo(start_pos.0, current_row),
+                terminal::Clear(ClearType::CurrentLine)
+            )?;
+            print!("Select files (↑/↓ to navigate, Space to toggle, Enter to confirm, Esc/q to cancel):");
+            current_row += 1;
+            
+            // Empty line
+            execute!(
+                std::io::stdout(),
+                cursor::MoveTo(start_pos.0, current_row),
+                terminal::Clear(ClearType::CurrentLine)
+            )?;
+            current_row += 1;
+            
+            // Display files
+            for (idx, file) in files.iter().enumerate() {
+                execute!(
+                    std::io::stdout(),
+                    cursor::MoveTo(start_pos.0, current_row),
+                    terminal::Clear(ClearType::CurrentLine)
+                )?;
+                
+                let color = cl_to_color.get(&file.changelist).unwrap();
+                let cl_label = if file.changelist == "default" {
+                    "default".to_string()
+                } else {
+                    file.changelist.clone()
+                };
+                
+                let checkbox = if selected_set.contains(&idx) { "[✓]" } else { "[ ]" };
+                let arrow = if idx == selected_idx { "→" } else { " " };
+                
+                let line = format!("  {}  {} CL {:8} {}", 
+                    arrow, checkbox, cl_label, file.depot_file);
+                
+                if idx == selected_idx {
+                    print!("{}", color(&line).bold().to_string());
+                } else {
+                    print!("{}", color(&line));
+                }
+                current_row += 1;
+            }
+            
+            // Empty line
+            execute!(
+                std::io::stdout(),
+                cursor::MoveTo(start_pos.0, current_row),
+                terminal::Clear(ClearType::CurrentLine)
+            )?;
+            current_row += 1;
+            
+            // Selected count
+            execute!(
+                std::io::stdout(),
+                cursor::MoveTo(start_pos.0, current_row),
+                terminal::Clear(ClearType::CurrentLine)
+            )?;
+            print!("Selected: {} file(s)", selected_set.len());
+            current_row += 1;
+            
+            // Clear any remaining lines on first draw
+            if first_draw {
+                execute!(
+                    std::io::stdout(),
+                    cursor::MoveTo(start_pos.0, current_row),
+                    terminal::Clear(ClearType::FromCursorDown)
+                )?;
+                first_draw = false;
+            }
+            
+            std::io::stdout().flush()?;
+            
+            // Read key event
+            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                match code {
+                    KeyCode::Up => {
+                        if selected_idx > 0 {
+                            selected_idx -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if selected_idx < files.len() - 1 {
+                            selected_idx += 1;
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if selected_set.contains(&selected_idx) {
+                            selected_set.remove(&selected_idx);
+                        } else {
+                            selected_set.insert(selected_idx);
+                        }
+                    }
+                    KeyCode::Enter => {
+                        terminal::disable_raw_mode()?;
+                        execute!(std::io::stdout(), cursor::Show)?;
+                        // Clear the menu
+                        execute!(
+                            std::io::stdout(),
+                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            terminal::Clear(ClearType::FromCursorDown)
+                        )?;
+                        
+                        let mut result = Vec::new();
+                        for idx in selected_set {
+                            result.push(files[idx].clone());
+                        }
+                        return Ok(result);
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        terminal::disable_raw_mode()?;
+                        execute!(std::io::stdout(), cursor::Show)?;
+                        // Clear the menu
+                        execute!(
+                            std::io::stdout(),
+                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            terminal::Clear(ClearType::FromCursorDown)
+                        )?;
+                        println!("Cancelled.");
+                        return Ok(Vec::new());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })();
+    
+    // Always disable raw mode and show cursor on exit
+    terminal::disable_raw_mode()?;
+    execute!(std::io::stdout(), cursor::Show)?;
+    
+    result
+}
+
 fn interactive_select(items: &[String]) -> Result<Option<String>> {
     let mut selected_idx = 0usize;
     
@@ -197,6 +521,8 @@ fn interactive_select(items: &[String]) -> Result<Option<String>> {
             for (idx, item) in items.iter().enumerate() {
                 let display = if item == "default" {
                     "CL default (pending)".to_string()
+                } else if item == "new" {
+                    "→ new CL".to_string()
                 } else {
                     format!("CL {}", item)
                 };

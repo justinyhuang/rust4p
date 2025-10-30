@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
@@ -77,4 +78,116 @@ pub fn get_opened_files() -> Result<Vec<OpenedFile>> {
         out.push(current);
     }
     Ok(out)
+}
+
+/// Get changelist description. Returns None if CL doesn't exist.
+pub fn get_change_description(cl_number: &str) -> Result<Option<String>> {
+    let output = Command::new("p4")
+        .arg("change")
+        .arg("-o")
+        .arg(cl_number)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to execute p4 change -o {}", cl_number))?;
+    
+    if !output.status.success() {
+        // CL doesn't exist
+        return Ok(None);
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut description = String::new();
+    let mut in_description = false;
+    
+    for line in stdout.lines() {
+        if line.starts_with("Description:") {
+            in_description = true;
+            continue;
+        }
+        if in_description {
+            if line.starts_with('\t') || line.starts_with("    ") {
+                description.push_str(line.trim());
+                description.push('\n');
+            } else {
+                break;
+            }
+        }
+    }
+    
+    Ok(Some(description.trim().to_string()))
+}
+
+/// Create a new changelist. Returns the CL number.
+pub fn create_changelist() -> Result<String> {
+    let output = Command::new("p4")
+        .arg("change")
+        .arg("-o")
+        .stdout(Stdio::piped())
+        .output()
+        .context("Failed to get changelist template")?;
+    
+    if !output.status.success() {
+        anyhow::bail!("Failed to get changelist template");
+    }
+    
+    let template = String::from_utf8_lossy(&output.stdout);
+    let mut modified = String::new();
+    
+    for line in template.lines() {
+        if line.starts_with("Change:") {
+            modified.push_str("Change:\tnew\n");
+        } else if line.starts_with("Description:") {
+            modified.push_str("Description:\n\t<enter description here>\n");
+        } else {
+            modified.push_str(line);
+            modified.push('\n');
+        }
+    }
+    
+    let mut child = Command::new("p4")
+        .arg("change")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn p4 change -i")?;
+    
+    child.stdin.as_mut().unwrap().write_all(modified.as_bytes())?;
+    
+    let output = child.wait_with_output()?;
+    
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to create changelist: {}", err);
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse "Change 12345 created."
+    let re = Regex::new(r"Change (\d+) created").unwrap();
+    if let Some(cap) = re.captures(&stdout) {
+        Ok(cap[1].to_string())
+    } else {
+        anyhow::bail!("Failed to parse CL number from: {}", stdout);
+    }
+}
+
+/// Unshelve files from a changelist
+pub fn unshelve_changelist(cl_number: &str) -> Result<()> {
+    let output = Command::new("p4")
+        .arg("unshelve")
+        .arg("-s")
+        .arg(cl_number)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to unshelve CL {}", cl_number))?;
+    
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to unshelve: {}", err);
+    }
+    
+    Ok(())
 }
