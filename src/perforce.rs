@@ -194,26 +194,48 @@ pub fn unshelve_changelist(cl_number: &str) -> Result<()> {
 
 /// Get the depot path for a local file using p4 where
 pub fn get_depot_path(local_path: &str) -> Result<Option<String>> {
+    // Try to canonicalize the path first (resolve relative paths, symlinks, etc.)
+    let resolved_path = std::fs::canonicalize(local_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(local_path));
+    
+    let path_str = resolved_path.to_string_lossy();
+    
     let output = Command::new("p4")
         .arg("where")
-        .arg(local_path)
+        .arg(path_str.as_ref())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("Failed to run p4 where on {}", local_path))?;
+        .with_context(|| format!("Failed to run p4 where on {}", path_str))?;
     
-    if !output.status.success() {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    // Check for common error messages
+    if stderr.contains("not in client view") || stderr.contains("file(s) not in client view") {
+        eprintln!("Debug: File is not in the Perforce client view");
+        eprintln!("Debug: stderr: {}", stderr.trim());
         return Ok(None);
     }
     
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        eprintln!("Debug: p4 where failed");
+        eprintln!("Debug: stderr: {}", stderr.trim());
+        eprintln!("Debug: stdout: {}", stdout.trim());
+        return Ok(None);
+    }
+    
     // p4 where output format: depot_path client_path local_path
     // We want the first field (depot path)
     if let Some(line) = stdout.lines().next() {
         if let Some(depot_path) = line.split_whitespace().next() {
-            return Ok(Some(depot_path.to_string()));
+            if depot_path.starts_with("//") {
+                return Ok(Some(depot_path.to_string()));
+            }
         }
     }
     
+    eprintln!("Debug: Could not parse depot path from p4 where output");
+    eprintln!("Debug: stdout: {}", stdout.trim());
     Ok(None)
 }

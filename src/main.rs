@@ -767,8 +767,28 @@ fn interactive_file_select(
     let mut selected_idx = 0usize;
     let mut selected_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
     
-    // Get current cursor position
-    let start_pos = cursor::position()?;
+    // Get terminal size and current cursor position
+    let (_term_width, term_height) = terminal::size()?;
+    let initial_pos = cursor::position()?;
+    
+    // Calculate how many lines we need (header + blank + files + blank + footer)
+    let needed_lines = 5 + files.len();
+    let available_lines = (term_height - initial_pos.1) as usize;
+    
+    // If we don't have enough space, move cursor up
+    let start_pos = if available_lines < needed_lines {
+        // Move cursor to a position where we have enough space
+        let new_row = term_height.saturating_sub(needed_lines as u16 + 1);
+        execute!(
+            std::io::stdout(), 
+            cursor::MoveTo(0, new_row),
+            terminal::Clear(ClearType::FromCursorDown)
+        )?;
+        std::io::stdout().flush()?;
+        cursor::position()?
+    } else {
+        initial_pos
+    };
     
     // Enable raw mode
     terminal::enable_raw_mode()?;
@@ -781,6 +801,7 @@ fn interactive_file_select(
                 cursor::MoveTo(start_pos.0, start_pos.1),
                 terminal::Clear(ClearType::FromCursorDown)
             )?;
+            std::io::stdout().flush()?;
             
             // Display header
             print!("Select files (↑/↓ to navigate, Space to toggle, Enter to confirm, Esc/q to cancel):\r\n\r\n");
@@ -873,8 +894,28 @@ fn interactive_file_select(
 fn interactive_select_with_desc(items: &[String], descriptions: &HashMap<String, String>) -> Result<Option<String>> {
     let mut selected_idx = 0usize;
     
-    // Get current cursor position
-    let start_pos = cursor::position()?;
+    // Get terminal size and current cursor position
+    let (_term_width, term_height) = terminal::size()?;
+    let initial_pos = cursor::position()?;
+    
+    // Calculate how many lines we need (header + blank + items)
+    let needed_lines = 3 + items.len();
+    let available_lines = (term_height - initial_pos.1) as usize;
+    
+    // If we don't have enough space, move cursor up or clear screen
+    let start_pos = if available_lines < needed_lines {
+        // Move cursor to a position where we have enough space
+        let new_row = term_height.saturating_sub(needed_lines as u16 + 1);
+        execute!(
+            std::io::stdout(), 
+            cursor::MoveTo(0, new_row),
+            terminal::Clear(ClearType::FromCursorDown)
+        )?;
+        std::io::stdout().flush()?;
+        cursor::position()?
+    } else {
+        initial_pos
+    };
     
     // Enable raw mode
     terminal::enable_raw_mode()?;
@@ -887,6 +928,7 @@ fn interactive_select_with_desc(items: &[String], descriptions: &HashMap<String,
                 cursor::MoveTo(start_pos.0, start_pos.1),
                 terminal::Clear(ClearType::FromCursorDown)
             )?;
+            std::io::stdout().flush()?;
             
             // Display header
             print!("Select a changelist (↑/↓ to navigate, Enter to edit, Esc/q to cancel):\r\n\r\n");
