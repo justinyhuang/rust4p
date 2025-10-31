@@ -191,3 +191,29 @@ pub fn unshelve_changelist(cl_number: &str) -> Result<()> {
     
     Ok(())
 }
+
+/// Get the depot path for a local file using p4 where
+pub fn get_depot_path(local_path: &str) -> Result<Option<String>> {
+    let output = Command::new("p4")
+        .arg("where")
+        .arg(local_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to run p4 where on {}", local_path))?;
+    
+    if !output.status.success() {
+        return Ok(None);
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // p4 where output format: depot_path client_path local_path
+    // We want the first field (depot path)
+    if let Some(line) = stdout.lines().next() {
+        if let Some(depot_path) = line.split_whitespace().next() {
+            return Ok(Some(depot_path.to_string()));
+        }
+    }
+    
+    Ok(None)
+}

@@ -35,6 +35,12 @@ enum Commands {
     Unshelve,
     /// Diff files in a changelist.
     Diff,
+    /// Open a file for edit in a specific changelist.
+    #[command(name = "open")]
+    Open {
+        /// Path to the file to open
+        file: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -47,6 +53,7 @@ fn main() -> Result<()> {
         Commands::Revert => cmd_revert()?,
         Commands::Unshelve => cmd_unshelve()?,
         Commands::Diff => cmd_diff()?,
+        Commands::Open { file } => cmd_open(&file)?,
     }
     Ok(())
 }
@@ -572,6 +579,90 @@ fn cmd_diff() -> Result<()> {
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()?;
+    }
+
+    Ok(())
+}
+
+fn cmd_open(file_path: &str) -> Result<()> {
+    // Get the depot path for the given file
+    let depot_path = match perforce::get_depot_path(file_path)? {
+        Some(path) => path,
+        None => {
+            eprintln!("Error: File '{}' is not in the Perforce workspace or doesn't exist.", file_path);
+            return Ok(());
+        }
+    };
+
+    println!("Depot path: {}", depot_path.bright_cyan());
+    println!();
+
+    // Get all open changelists
+    let opened = perforce::get_opened_files()?;
+    
+    // Get unique CLs
+    let mut cls: Vec<String> = opened
+        .iter()
+        .map(|f| f.changelist.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    
+    // Sort: default first, then numeric
+    cls.sort_by(|a, b| {
+        if a == "default" && b != "default" {
+            std::cmp::Ordering::Less
+        } else if b == "default" && a != "default" {
+            std::cmp::Ordering::Greater
+        } else {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            }
+        }
+    });
+    
+    // Always include "default" if not already present
+    if !cls.contains(&"default".to_string()) {
+        cls.insert(0, "default".to_string());
+    }
+    
+    // Fetch descriptions for each CL
+    let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    for cl in &cls {
+        if cl != "default" {
+            if let Ok(Some(desc)) = perforce::get_change_description(cl) {
+                let first_line = desc.lines().next().unwrap_or("").trim();
+                cl_descriptions.insert(cl.clone(), first_line.to_string());
+            }
+        }
+    }
+    
+    println!("Select a changelist to open the file to:");
+    println!();
+    
+    let selected_cl = match interactive_select_with_desc(&cls, &cl_descriptions)? {
+        Some(cl) => cl,
+        None => {
+            println!("No changelist selected.");
+            return Ok(());
+        }
+    };
+    
+    // Run p4 edit -c <CL> <depot_path>
+    let output = std::process::Command::new("p4")
+        .arg("edit")
+        .arg("-c")
+        .arg(&selected_cl)
+        .arg(&depot_path)
+        .output()?;
+    
+    if output.status.success() {
+        println!("\n{}", "File opened successfully!".bright_green());
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    } else {
+        eprintln!("\n{}", "Error opening file:".bright_red());
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
     }
 
     Ok(())
