@@ -41,6 +41,12 @@ enum Commands {
         /// Path to the file to open
         file: String,
     },
+    /// Initialize a git repository in the current directory.
+    #[command(name = "ginit")]
+    Ginit,
+    /// Remove git repository but keep all files.
+    #[command(name = "gdeinit")]
+    Gdeinit,
 }
 
 fn main() -> Result<()> {
@@ -54,6 +60,8 @@ fn main() -> Result<()> {
         Commands::Unshelve => cmd_unshelve()?,
         Commands::Diff => cmd_diff()?,
         Commands::Open { file } => cmd_open(&file)?,
+        Commands::Ginit => cmd_ginit()?,
+        Commands::Gdeinit => cmd_gdeinit()?,
     }
     Ok(())
 }
@@ -756,6 +764,224 @@ fn cmd_unshelve() -> Result<()> {
     }
     
     println!("\nDone! CL {} is ready for use.", cl_number);
+    
+    Ok(())
+}
+
+fn cmd_ginit() -> Result<()> {
+    // Get current directory
+    let current_dir = std::env::current_dir()?;
+    let current_path = current_dir.display();
+    
+    // Check if .git directory already exists
+    let git_dir = current_dir.join(".git");
+    if git_dir.exists() {
+        println!("{}", "A git repository already exists in this directory.".bright_yellow());
+        println!("Path: {}", current_path);
+        return Ok(());
+    }
+    
+    // Ask for confirmation
+    println!("Initialize a git repository in: {}", current_path.to_string().bright_cyan());
+    println!("Are you sure? (y/n):");
+    
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let answer = input.trim().to_lowercase();
+    
+    if answer != "y" && answer != "yes" {
+        println!("Cancelled.");
+        return Ok(());
+    }
+    
+    // Run git init
+    let output = std::process::Command::new("git")
+        .arg("init")
+        .output()?;
+    
+    if !output.status.success() {
+        eprintln!("\n{}", "Error initializing git repository:".bright_red());
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        return Ok(());
+    }
+    
+    println!("\n{}", "✓ Git repository initialized successfully!".bright_green());
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    
+    // Get opened Perforce files
+    println!("\nChecking for Perforce opened files...");
+    let opened_files = match perforce::get_opened_files() {
+        Ok(files) => files,
+        Err(_) => {
+            println!("No Perforce files opened or not in a Perforce workspace.");
+            return Ok(());
+        }
+    };
+    
+    if opened_files.is_empty() {
+        println!("No Perforce files are currently opened.");
+        return Ok(());
+    }
+    
+    // Filter files that are under the current directory and collect their info
+    let current_dir_str = current_dir.to_string_lossy();
+    let mut files_info: Vec<(String, String, Option<String>)> = Vec::new(); // (local_path, depot_path, workrev)
+    
+    for file in &opened_files {
+        // Get the local file path by running p4 where on the depot path
+        let output = std::process::Command::new("p4")
+            .arg("where")
+            .arg(&file.depot_file)
+            .output()?;
+        
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // p4 where output: depot_path client_path local_path
+            if let Some(line) = stdout.lines().next() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    let local_path = parts[2];
+                    // Check if the local path is under current directory
+                    if local_path.starts_with(current_dir_str.as_ref()) {
+                        files_info.push((
+                            local_path.to_string(),
+                            file.depot_file.clone(),
+                            file.workrev.clone()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    
+    if files_info.is_empty() {
+        println!("No Perforce files found under the current directory.");
+        return Ok(());
+    }
+    
+    // Step 1: Save current working versions (with P4 changes)
+    println!("\n{}", "Step 1: Saving current file versions...".bright_cyan());
+    let mut saved_contents: Vec<(String, Vec<u8>)> = Vec::new();
+    for (local_path, _, _) in &files_info {
+        if let Ok(content) = std::fs::read(local_path) {
+            saved_contents.push((local_path.clone(), content));
+            println!("  {} {}", "✓".bright_green(), local_path);
+        }
+    }
+    
+    // Step 2: Restore original versions from Perforce
+    println!("\n{}", "Step 2: Restoring original file versions from Perforce...".bright_cyan());
+    for (local_path, depot_path, workrev) in &files_info {
+        // Construct the depot path with revision
+        let depot_with_rev = if let Some(rev) = workrev {
+            format!("{}#{}", depot_path, rev)
+        } else {
+            format!("{}#have", depot_path)
+        };
+        
+        // Get the original content using p4 print
+        let output = std::process::Command::new("p4")
+            .arg("print")
+            .arg("-q") // quiet, no extra output
+            .arg(&depot_with_rev)
+            .output()?;
+        
+        if output.status.success() {
+            std::fs::write(local_path, &output.stdout)?;
+            println!("  {} {}", "✓".bright_green(), local_path);
+        } else {
+            eprintln!("  {} {} - {}", "✗".bright_red(), local_path,
+                String::from_utf8_lossy(&output.stderr).trim());
+        }
+    }
+    
+    // Step 3: Stage original versions and create initial commit
+    println!("\n{}", "Step 3: Creating initial commit with original versions...".bright_cyan());
+    for (local_path, _, _) in &files_info {
+        std::process::Command::new("git")
+            .arg("add")
+            .arg(local_path)
+            .output()?;
+    }
+    
+    let commit_output = std::process::Command::new("git")
+        .arg("commit")
+        .arg("-m")
+        .arg("Initial commit: Original versions from Perforce")
+        .output()?;
+    
+    if commit_output.status.success() {
+        println!("{}", "✓ Initial commit created".bright_green());
+    } else {
+        eprintln!("{} {}", "✗".bright_red(), 
+            String::from_utf8_lossy(&commit_output.stderr).trim());
+    }
+    
+    // Step 4: Restore current working versions (with changes)
+    println!("\n{}", "Step 4: Restoring your current changes...".bright_cyan());
+    for (local_path, content) in &saved_contents {
+        std::fs::write(local_path, content)?;
+        println!("  {} {}", "✓".bright_green(), local_path);
+    }
+    
+    // Show git status
+    println!("\n{}", "Git status:".bright_cyan());
+    let status_output = std::process::Command::new("git")
+        .arg("status")
+        .arg("--short")
+        .output()?;
+    
+    if status_output.status.success() {
+        print!("{}", String::from_utf8_lossy(&status_output.stdout));
+    }
+    
+    println!("\n{}", format!("✓ Complete! {} file(s) ready with your changes", files_info.len()).bright_green());
+    println!("{}", "  Initial commit contains the original Perforce versions".bright_blue());
+    println!("{}", "  Your changes are unstaged - use 'git diff' to see them".bright_blue());
+    
+    Ok(())
+}
+
+fn cmd_gdeinit() -> Result<()> {
+    // Get current directory
+    let current_dir = std::env::current_dir()?;
+    let current_path = current_dir.display();
+    
+    // Check if .git directory exists
+    let git_dir = current_dir.join(".git");
+    if !git_dir.exists() {
+        println!("{}", "No git repository found in this directory.".bright_yellow());
+        println!("Path: {}", current_path);
+        return Ok(());
+    }
+    
+    // Ask for confirmation
+    println!("{}", "⚠️  WARNING: This will remove the git repository!".bright_red().bold());
+    println!("Directory: {}", current_path.to_string().bright_cyan());
+    println!("All files will be kept, only the .git directory will be removed.");
+    println!("\nAre you sure? (y/n):");
+    
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let answer = input.trim().to_lowercase();
+    
+    if answer != "y" && answer != "yes" {
+        println!("Cancelled.");
+        return Ok(());
+    }
+    
+    // Remove .git directory
+    match std::fs::remove_dir_all(&git_dir) {
+        Ok(_) => {
+            println!("\n{}", "✓ Git repository removed successfully!".bright_green());
+            println!("All files have been preserved.");
+        }
+        Err(e) => {
+            eprintln!("\n{}", "Error removing git repository:".bright_red());
+            eprintln!("{}", e);
+            return Err(e.into());
+        }
+    }
     
     Ok(())
 }
