@@ -33,6 +33,8 @@ enum Commands {
     Revert,
     /// Unshelve files from a changelist.
     Unshelve,
+    /// Diff files in a changelist.
+    Diff,
 }
 
 fn main() -> Result<()> {
@@ -44,6 +46,7 @@ fn main() -> Result<()> {
         Commands::Reopen => cmd_reopen()?,
         Commands::Revert => cmd_revert()?,
         Commands::Unshelve => cmd_unshelve()?,
+        Commands::Diff => cmd_diff()?,
     }
     Ok(())
 }
@@ -500,6 +503,77 @@ fn cmd_revert() -> Result<()> {
     
     println!("\nDone!");
     
+    Ok(())
+}
+
+fn cmd_diff() -> Result<()> {
+    let opened = perforce::get_opened_files()?;
+    
+    // Group by changelist
+    let mut map: HashMap<String, Vec<perforce::OpenedFile>> = HashMap::new();
+    for f in opened {
+        map.entry(f.changelist.clone()).or_default().push(f);
+    }
+
+    // Stable order: default first, then numeric ascending
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    keys.sort_by(|a, b| {
+        if a == "default" && b != "default" {
+            std::cmp::Ordering::Less
+        } else if b == "default" && a != "default" {
+            std::cmp::Ordering::Greater
+        } else {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            }
+        }
+    });
+
+    // Fetch descriptions for each CL
+    let mut descriptions: HashMap<String, String> = HashMap::new();
+    for key in &keys {
+        if key != "default" {
+            if let Ok(Some(desc)) = perforce::get_change_description(key) {
+                let first_line = desc.lines().next().unwrap_or("").trim();
+                descriptions.insert(key.clone(), first_line.to_string());
+            }
+        }
+    }
+
+    if keys.is_empty() {
+        println!("No opened files found.");
+        return Ok(());
+    }
+
+    println!("Select a changelist to diff:");
+    println!();
+    let selected_cl = match interactive_select_with_desc(&keys, &descriptions)? {
+        Some(cl) => cl,
+        None => {
+            println!("No changelist selected.");
+            return Ok(());
+        }
+    };
+    
+    // Get files from selected CL
+    let files = map.get(&selected_cl).unwrap();
+    
+    // Run p4 diff on each file
+    for file in files {
+        println!("\n{}", "=".repeat(80).bright_blue());
+        println!("{} {}", "Diff:".bright_yellow(), file.depot_file);
+        println!("{}", "=".repeat(80).bright_blue());
+        
+        let _status = std::process::Command::new("p4")
+            .arg("diff")
+            .arg(&file.depot_file)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
+    }
+
     Ok(())
 }
 
