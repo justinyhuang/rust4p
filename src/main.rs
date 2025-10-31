@@ -326,9 +326,20 @@ fn cmd_reopen() -> Result<()> {
     // Add "new CL" option at the end
     dest_cls.push("new".to_string());
     
+    // Fetch descriptions for destination CLs
+    let mut dest_descriptions: HashMap<String, String> = HashMap::new();
+    for cl in &dest_cls {
+        if cl != "default" && cl != "new" {
+            if let Ok(Some(desc)) = perforce::get_change_description(cl) {
+                let first_line = desc.lines().next().unwrap_or("").trim();
+                dest_descriptions.insert(cl.clone(), first_line.to_string());
+            }
+        }
+    }
+    
     // Show CL selector
     println!("\nSelect destination changelist:");
-    let dest_cl = interactive_select(&dest_cls)?;
+    let dest_cl = interactive_select_with_desc(&dest_cls, &dest_descriptions)?;
     
     if let Some(cl) = dest_cl {
         let final_cl = if cl == "new" {
@@ -955,99 +966,6 @@ fn interactive_select_with_desc(items: &[String], descriptions: &HashMap<String,
     
     result
 }
-
-fn interactive_select(items: &[String]) -> Result<Option<String>> {
-    let mut selected_idx = 0usize;
-    
-    // Get current cursor position
-    let start_pos = cursor::position()?;
-    
-    // Enable raw mode
-    terminal::enable_raw_mode()?;
-    
-    let result = (|| -> Result<Option<String>> {
-        loop {
-            // Move cursor to start position and clear from here down
-            execute!(
-                std::io::stdout(),
-                cursor::MoveTo(start_pos.0, start_pos.1),
-                terminal::Clear(ClearType::FromCursorDown)
-            )?;
-            
-            // Display header
-            print!("Select a changelist (↑/↓ to navigate, Enter to edit, Esc/q to cancel):\r\n\r\n");
-            
-            // Display items
-            for (idx, item) in items.iter().enumerate() {
-                let display = if item == "default" {
-                    "CL default (pending)".to_string()
-                } else if item == "new" {
-                    "→ new CL".to_string()
-                } else {
-                    format!("CL {}", item)
-                };
-                
-                if idx == selected_idx {
-                    print!("  {}  {}\r\n", "→".bright_green(), display.bright_green().bold());
-                } else {
-                    print!("     {}\r\n", display);
-                }
-            }
-            
-            std::io::stdout().flush()?;
-            
-            // Read key event
-            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
-                match code {
-                    KeyCode::Up => {
-                        if selected_idx > 0 {
-                            selected_idx -= 1;
-                        }
-                    }
-                    KeyCode::Down => {
-                        if selected_idx < items.len() - 1 {
-                            selected_idx += 1;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        let result = items[selected_idx].clone();
-                        terminal::disable_raw_mode()?;
-                        // Clear the menu and print final selection
-                        execute!(
-                            std::io::stdout(),
-                            cursor::MoveTo(start_pos.0, start_pos.1),
-                            terminal::Clear(ClearType::FromCursorDown)
-                        )?;
-                        println!("Selected: {}", if result == "default" {
-                            "CL default (pending)".to_string()
-                        } else {
-                            format!("CL {}", result)
-                        });
-                        return Ok(Some(result));
-                    }
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        terminal::disable_raw_mode()?;
-                        // Clear the menu
-                        execute!(
-                            std::io::stdout(),
-                            cursor::MoveTo(start_pos.0, start_pos.1),
-                            terminal::Clear(ClearType::FromCursorDown)
-                        )?;
-                        println!("Cancelled.");
-                        return Ok(None);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    })();
-    
-    // Always disable raw mode on exit
-    terminal::disable_raw_mode()?;
-    
-    result
-}
-
 
 fn action_emoji(action: &str) -> &str {
     match action {
