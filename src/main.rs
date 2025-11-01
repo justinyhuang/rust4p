@@ -33,6 +33,8 @@ enum Commands {
     Revert,
     /// Unshelve files from a changelist.
     Unshelve,
+    /// Shelve files in a changelist.
+    Shelve,
     /// Diff files in a changelist.
     Diff,
     /// Open a file for edit in a specific changelist.
@@ -58,6 +60,7 @@ fn main() -> Result<()> {
         Commands::Reopen => cmd_reopen()?,
         Commands::Revert => cmd_revert()?,
         Commands::Unshelve => cmd_unshelve()?,
+        Commands::Shelve => cmd_shelve()?,
         Commands::Diff => cmd_diff()?,
         Commands::Open { file } => cmd_open(&file)?,
         Commands::Ginit => cmd_ginit()?,
@@ -201,13 +204,13 @@ fn cmd_change() -> Result<()> {
         }
     });
     
-    if cls.is_empty() {
-        println!("No open changelists found.");
-        return Ok(());
-    }
+    // Add "Create new CL" option at the beginning
+    let mut options = vec!["[Create new CL]".to_string()];
+    options.extend(cls.clone());
     
     // Fetch descriptions for each CL
     let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    cl_descriptions.insert("[Create new CL]".to_string(), "Create a new changelist".to_string());
     for cl in &cls {
         if cl != "default" {
             if let Ok(Some(desc)) = perforce::get_change_description(cl) {
@@ -218,10 +221,24 @@ fn cmd_change() -> Result<()> {
         }
     }
     
-    // Run interactive selector
-    let selected = interactive_select_with_desc(&cls, &cl_descriptions)?;
+    println!("Select a changelist to edit:");
+    println!();
     
-    if let Some(cl) = selected {
+    // Run interactive selector
+    let selected = interactive_select_with_desc(&options, &cl_descriptions)?;
+    
+    if let Some(selection) = selected {
+        let cl = if selection == "[Create new CL]" {
+            // Create a new changelist
+            println!("\nCreating new changelist...");
+            let new_cl = perforce::create_changelist()?;
+            println!("{}", format!("✓ Created CL {}", new_cl).bright_green());
+            println!();
+            new_cl
+        } else {
+            selection
+        };
+        
         // Execute p4 change <CL>
         let mut cmd = std::process::Command::new("p4");
         cmd.arg("change").arg(&cl);
@@ -765,6 +782,82 @@ fn cmd_unshelve() -> Result<()> {
     
     println!("\nDone! CL {} is ready for use.", cl_number);
     
+    Ok(())
+}
+
+fn cmd_shelve() -> Result<()> {
+    let opened = perforce::get_opened_files()?;
+    
+    // Group by changelist
+    let mut map: HashMap<String, Vec<perforce::OpenedFile>> = HashMap::new();
+    for f in opened {
+        map.entry(f.changelist.clone()).or_default().push(f);
+    }
+
+    // Stable order: default first, then numeric ascending
+    let mut keys: Vec<String> = map.keys().cloned().collect();
+    keys.sort_by(|a, b| {
+        if a == "default" && b != "default" {
+            std::cmp::Ordering::Less
+        } else if b == "default" && a != "default" {
+            std::cmp::Ordering::Greater
+        } else {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            }
+        }
+    });
+
+    // Fetch descriptions for each CL
+    let mut descriptions: HashMap<String, String> = HashMap::new();
+    for key in &keys {
+        if key != "default" {
+            if let Ok(Some(desc)) = perforce::get_change_description(key) {
+                let first_line = desc.lines().next().unwrap_or("").trim();
+                descriptions.insert(key.clone(), first_line.to_string());
+            }
+        }
+    }
+
+    if keys.is_empty() {
+        println!("No opened files found.");
+        return Ok(());
+    }
+
+    println!("Select a changelist to shelve:");
+    println!();
+    let selected_cl = match interactive_select_with_desc(&keys, &descriptions)? {
+        Some(cl) => cl,
+        None => {
+            println!("No changelist selected.");
+            return Ok(());
+        }
+    };
+    
+    // Get files from selected CL
+    let files = map.get(&selected_cl).unwrap();
+    
+    println!("\nShelving {} file(s) from CL {}...", files.len(), selected_cl);
+    
+    // Run p4 shelve -r -c <CL>
+    // The -r flag replaces all shelved files, removing files no longer in the CL
+    let output = std::process::Command::new("p4")
+        .arg("shelve")
+        .arg("-r")
+        .arg("-c")
+        .arg(&selected_cl)
+        .output()?;
+    
+    if output.status.success() {
+        println!("\n{}", "✓ Successfully shelved files!".bright_green());
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    } else {
+        eprintln!("\n{}", "Error shelving files:".bright_red());
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        return Err(anyhow::anyhow!("p4 shelve command failed"));
+    }
+
     Ok(())
 }
 
