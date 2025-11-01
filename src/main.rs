@@ -162,7 +162,7 @@ fn cmd_opened() -> Result<()> {
             palette[palette_idx % palette.len()]
         };
         if key != "default" {
-            palette_idx += 1;
+        palette_idx += 1;
         }
 
         let title = if key == "default" {
@@ -826,7 +826,7 @@ fn cmd_shelve() -> Result<()> {
     }
 
     println!("Select a changelist to shelve:");
-    println!();
+        println!();
     let selected_cl = match interactive_select_with_desc(&keys, &descriptions)? {
         Some(cl) => cl,
         None => {
@@ -1075,7 +1075,7 @@ fn cmd_gdeinit() -> Result<()> {
             return Err(e.into());
         }
     }
-    
+
     Ok(())
 }
 
@@ -1158,11 +1158,17 @@ fn interactive_file_select(
                     KeyCode::Up => {
                         if selected_idx > 0 {
                             selected_idx -= 1;
+                        } else {
+                            // Wrap to bottom
+                            selected_idx = files.len() - 1;
                         }
                     }
                     KeyCode::Down => {
                         if selected_idx < files.len() - 1 {
                             selected_idx += 1;
+                        } else {
+                            // Wrap to top
+                            selected_idx = 0;
                         }
                     }
                     KeyCode::Char(' ') => {
@@ -1282,11 +1288,17 @@ fn interactive_select_with_desc(items: &[String], descriptions: &HashMap<String,
                     KeyCode::Up => {
                         if selected_idx > 0 {
                             selected_idx -= 1;
+                        } else {
+                            // Wrap to bottom
+                            selected_idx = items.len() - 1;
                         }
                     }
                     KeyCode::Down => {
                         if selected_idx < items.len() - 1 {
                             selected_idx += 1;
+                        } else {
+                            // Wrap to top
+                            selected_idx = 0;
                         }
                     }
                     KeyCode::Enter => {
@@ -1369,7 +1381,7 @@ where
     if skip_top {
         println!("{}", colorize(&mid));
     } else {
-        println!("{}", colorize(&top));
+    println!("{}", colorize(&top));
     }
     // Make title bold
     let bold_title = format!("\x1b[1m{}\x1b[0m", title);
@@ -1383,10 +1395,10 @@ where
     // Print description if provided
     if !description.is_empty() {
         let desc_pad = width - 2 - visual_width(description);
-        println!(
-            "{}",
+    println!(
+        "{}",
             colorize(&format!("{v} {}{:pad$} {v}", description, "", pad = desc_pad))
-        );
+    );
     }
     
     for l in lines {
@@ -1394,6 +1406,6 @@ where
         println!("{}", colorize(&format!("{v} {}{:pad$} {v}", l, "", pad = pad)));
     }
     if is_last {
-        println!("{}", colorize(&bot));
+    println!("{}", colorize(&bot));
     }
 }
