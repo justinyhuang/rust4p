@@ -43,6 +43,12 @@ enum Commands {
         /// Path to the file to open
         file: String,
     },
+    /// Add a new file to a specific changelist.
+    #[command(name = "add")]
+    Add {
+        /// Path to the file to add
+        file: String,
+    },
     /// Initialize a git repository in the current directory.
     #[command(name = "ginit")]
     Ginit,
@@ -63,6 +69,7 @@ fn main() -> Result<()> {
         Commands::Shelve => cmd_shelve()?,
         Commands::Diff => cmd_diff()?,
         Commands::Open { file } => cmd_open(&file)?,
+        Commands::Add { file } => cmd_add(&file)?,
         Commands::Ginit => cmd_ginit()?,
         Commands::Gdeinit => cmd_gdeinit()?,
     }
@@ -698,6 +705,87 @@ fn cmd_open(file_path: &str) -> Result<()> {
         print!("{}", String::from_utf8_lossy(&output.stdout));
     } else {
         eprintln!("\n{}", "Error opening file:".bright_red());
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    Ok(())
+}
+
+fn cmd_add(file_path: &str) -> Result<()> {
+    // Check if file exists
+    if !std::path::Path::new(file_path).exists() {
+        eprintln!("Error: File '{}' does not exist.", file_path);
+        return Ok(());
+    }
+
+    println!("Adding file: {}", file_path.bright_cyan());
+    println!();
+
+    // Get all open changelists
+    let opened = perforce::get_opened_files()?;
+    
+    // Get unique CLs
+    let mut cls: Vec<String> = opened
+        .iter()
+        .map(|f| f.changelist.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    
+    // Sort: default first, then numeric
+    cls.sort_by(|a, b| {
+        if a == "default" && b != "default" {
+            std::cmp::Ordering::Less
+        } else if b == "default" && a != "default" {
+            std::cmp::Ordering::Greater
+        } else {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            }
+        }
+    });
+    
+    // Always include "default" if not already present
+    if !cls.contains(&"default".to_string()) {
+        cls.insert(0, "default".to_string());
+    }
+    
+    // Fetch descriptions for each CL
+    let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    for cl in &cls {
+        if cl != "default" {
+            if let Ok(Some(desc)) = perforce::get_change_description(cl) {
+                let first_line = desc.lines().next().unwrap_or("").trim();
+                cl_descriptions.insert(cl.clone(), first_line.to_string());
+            }
+        }
+    }
+    
+    println!("Select a changelist to add the file to:");
+    println!();
+    
+    let selected_cl = match interactive_select_with_desc(&cls, &cl_descriptions)? {
+        Some(cl) => cl,
+        None => {
+            println!("No changelist selected.");
+            return Ok(());
+        }
+    };
+    
+    // Run p4 add -c <CL> <file_path>
+    let output = std::process::Command::new("p4")
+        .arg("add")
+        .arg("-c")
+        .arg(&selected_cl)
+        .arg(file_path)
+        .output()?;
+    
+    if output.status.success() {
+        println!("\n{}", "File added successfully!".bright_green());
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    } else {
+        eprintln!("\n{}", "Error adding file:".bright_red());
         eprintln!("{}", String::from_utf8_lossy(&output.stderr));
     }
 
