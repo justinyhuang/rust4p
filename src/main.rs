@@ -1167,10 +1167,47 @@ fn cmd_gdeinit() -> Result<()> {
     Ok(())
 }
 
+// Enum to represent items in the selection list
+#[derive(Clone)]
+enum SelectItem {
+    ClHeader(String), // changelist number/name
+    File(usize),      // index into the files array
+}
+
 fn interactive_file_select(
     files: &[perforce::OpenedFile],
     cl_to_color: &HashMap<String, fn(&str) -> String>,
 ) -> Result<Vec<perforce::OpenedFile>> {
+    // Group files by changelist
+    let mut cl_to_files: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, file) in files.iter().enumerate() {
+        cl_to_files.entry(file.changelist.clone()).or_default().push(idx);
+    }
+    
+    // Sort CLs: default first, then numeric
+    let mut cls: Vec<String> = cl_to_files.keys().cloned().collect();
+    cls.sort_by(|a, b| {
+        if a == "default" && b != "default" {
+            std::cmp::Ordering::Less
+        } else if b == "default" && a != "default" {
+            std::cmp::Ordering::Greater
+        } else {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            }
+        }
+    });
+    
+    // Build the display list: CL headers + files
+    let mut items: Vec<SelectItem> = Vec::new();
+    for cl in &cls {
+        items.push(SelectItem::ClHeader(cl.clone()));
+        for &file_idx in &cl_to_files[cl] {
+            items.push(SelectItem::File(file_idx));
+        }
+    }
+    
     let mut selected_idx = 0usize;
     let mut selected_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
     
@@ -1178,8 +1215,8 @@ fn interactive_file_select(
     let (_term_width, term_height) = terminal::size()?;
     let initial_pos = cursor::position()?;
     
-    // Calculate how many lines we need (header + blank + files + blank + footer)
-    let needed_lines = 5 + files.len();
+    // Calculate how many lines we need (header + blank + items + blank + footer)
+    let needed_lines = 5 + items.len();
     let available_lines = (term_height - initial_pos.1) as usize;
     
     // If we don't have enough space, move cursor up
@@ -1211,27 +1248,58 @@ fn interactive_file_select(
             std::io::stdout().flush()?;
             
             // Display header
-            print!("Select files (↑/↓ to navigate, Space to toggle, Enter to confirm, Esc/q to cancel):\r\n\r\n");
+            print!("Select files or CLs (↑/↓ to navigate, Space to toggle, Enter to confirm, Esc/q to cancel):\r\n\r\n");
             
-            // Display files
-            for (idx, file) in files.iter().enumerate() {
-                let color = cl_to_color.get(&file.changelist).unwrap();
-                let cl_label = if file.changelist == "default" {
-                    "default".to_string()
-                } else {
-                    file.changelist.clone()
-                };
-                
-                let checkbox = if selected_set.contains(&idx) { "[✓]" } else { "[ ]" };
+            // Display items
+            for (idx, item) in items.iter().enumerate() {
                 let arrow = if idx == selected_idx { "→" } else { " " };
                 
-                let line = format!("  {}  {} CL {:8} {}", 
-                    arrow, checkbox, cl_label, file.depot_file);
-                
-                if idx == selected_idx {
-                    print!("{}\r\n", color(&line).bold().to_string());
-                } else {
-                    print!("{}\r\n", color(&line));
+                match item {
+                    SelectItem::ClHeader(cl) => {
+                        let color = cl_to_color.get(cl).unwrap();
+                        let cl_label = if cl == "default" {
+                            "default (pending)".to_string()
+                        } else {
+                            cl.clone()
+                        };
+                        
+                        // Check if all files in this CL are selected
+                        let file_indices = &cl_to_files[cl];
+                        let all_selected = file_indices.iter().all(|&i| selected_set.contains(&i));
+                        let some_selected = file_indices.iter().any(|&i| selected_set.contains(&i));
+                        
+                        let checkbox = if all_selected {
+                            "[✓]"
+                        } else if some_selected {
+                            "[◐]"
+                        } else {
+                            "[ ]"
+                        };
+                        
+                        let line = format!("{}  {} 📋 CL {} — {} file(s)", 
+                            arrow, checkbox, cl_label, file_indices.len());
+                        
+                        if idx == selected_idx {
+                            print!("{}\r\n", color(&line).bold().to_string());
+                        } else {
+                            print!("{}\r\n", color(&line).bold().to_string());
+                        }
+                    }
+                    SelectItem::File(file_idx) => {
+                        let file = &files[*file_idx];
+                        let color = cl_to_color.get(&file.changelist).unwrap();
+                        
+                        let checkbox = if selected_set.contains(file_idx) { "[✓]" } else { "[ ]" };
+                        
+                        let line = format!("  {}  {}     {}", 
+                            arrow, checkbox, file.depot_file);
+                        
+                        if idx == selected_idx {
+                            print!("{}\r\n", color(&line).bold().to_string());
+                        } else {
+                            print!("{}\r\n", color(&line));
+                        }
+                    }
                 }
             }
             
@@ -1248,11 +1316,11 @@ fn interactive_file_select(
                             selected_idx -= 1;
                         } else {
                             // Wrap to bottom
-                            selected_idx = files.len() - 1;
+                            selected_idx = items.len() - 1;
                         }
                     }
                     KeyCode::Down => {
-                        if selected_idx < files.len() - 1 {
+                        if selected_idx < items.len() - 1 {
                             selected_idx += 1;
                         } else {
                             // Wrap to top
@@ -1260,10 +1328,32 @@ fn interactive_file_select(
                         }
                     }
                     KeyCode::Char(' ') => {
-                        if selected_set.contains(&selected_idx) {
-                            selected_set.remove(&selected_idx);
-                        } else {
-                            selected_set.insert(selected_idx);
+                        match &items[selected_idx] {
+                            SelectItem::ClHeader(cl) => {
+                                // Toggle all files in this CL
+                                let file_indices = &cl_to_files[cl];
+                                let all_selected = file_indices.iter().all(|&i| selected_set.contains(&i));
+                                
+                                if all_selected {
+                                    // Deselect all
+                                    for &file_idx in file_indices {
+                                        selected_set.remove(&file_idx);
+                                    }
+                                } else {
+                                    // Select all
+                                    for &file_idx in file_indices {
+                                        selected_set.insert(file_idx);
+                                    }
+                                }
+                            }
+                            SelectItem::File(file_idx) => {
+                                // Toggle single file
+                                if selected_set.contains(file_idx) {
+                                    selected_set.remove(file_idx);
+                                } else {
+                                    selected_set.insert(*file_idx);
+                                }
+                            }
                         }
                     }
                     KeyCode::Enter => {
