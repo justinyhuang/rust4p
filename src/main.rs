@@ -55,6 +55,9 @@ enum Commands {
     /// Remove git repository but keep all files.
     #[command(name = "gdeinit")]
     Gdeinit,
+    /// Manage tracked changelists.
+    #[command(name = "cls")]
+    Cls,
 }
 
 fn main() -> Result<()> {
@@ -72,6 +75,7 @@ fn main() -> Result<()> {
         Commands::Add { file } => cmd_add(&file)?,
         Commands::Ginit => cmd_ginit()?,
         Commands::Gdeinit => cmd_gdeinit()?,
+        Commands::Cls => cmd_cls()?,
     }
     Ok(())
 }
@@ -239,6 +243,7 @@ fn cmd_change() -> Result<()> {
             // Create a new changelist
             println!("\nCreating new changelist...");
             let new_cl = perforce::create_changelist()?;
+            add_tracked_cl(&new_cl)?;
             println!("{}", format!("✓ Created CL {}", new_cl).bright_green());
             println!();
             new_cl
@@ -385,6 +390,7 @@ fn cmd_reopen() -> Result<()> {
                 // Create new CL
                 println!("Creating new changelist...");
                 let new_cl = perforce::create_changelist()?;
+                add_tracked_cl(&new_cl)?;
                 println!("Created CL {}", new_cl);
                 new_cl
             } else {
@@ -408,6 +414,8 @@ fn cmd_reopen() -> Result<()> {
                         if let Err(e) = perforce::unshelve_changelist(input) {
                             eprintln!("Warning: Could not unshelve: {}", e);
                             println!("Continuing to reopen files...");
+                        } else {
+                            add_tracked_cl(input)?;
                         }
                         
                         input.to_string()
@@ -793,82 +801,228 @@ fn cmd_add(file_path: &str) -> Result<()> {
 }
 
 fn cmd_unshelve() -> Result<()> {
-    println!("Enter CL number to unshelve:");
+    // Get tracked CLs
+    let tracked_cls = read_tracked_cls()?;
     
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let cl_number = input.trim();
+    // Get currently opened files
+    let opened = perforce::get_opened_files()?;
     
-    if cl_number.is_empty() {
-        println!("Error: No CL number provided");
-        return Ok(());
+    // Build a set of CLs with opened files
+    let cls_with_files: std::collections::HashSet<String> = opened
+        .iter()
+        .map(|f| f.changelist.clone())
+        .filter(|cl| cl != "default")
+        .collect();
+    
+    // Filter tracked CLs to those without opened files
+    let empty_cls: Vec<String> = tracked_cls
+        .into_iter()
+        .filter(|cl| !cls_with_files.contains(cl))
+        .collect();
+    
+    // Build options list
+    let mut options: Vec<String> = empty_cls.clone();
+    options.push("[Enter CL number manually]".to_string());
+    
+    if empty_cls.is_empty() {
+        println!("{}", "No tracked CLs without opened files.".bright_yellow());
+        println!("You can still enter a CL number manually.");
+        println!();
+    } else {
+        println!("Select a CL to unshelve (tracked CLs without opened files):");
+        println!();
     }
     
-    // Validate it's a number
-    if cl_number.parse::<i64>().is_err() {
-        println!("Error: Invalid CL number '{}'", cl_number);
-        return Ok(());
+    // Fetch descriptions
+    let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    for cl in &empty_cls {
+        if let Ok(Some(desc)) = perforce::get_change_description(cl) {
+            let first_line = desc.lines().next().unwrap_or("").trim();
+            cl_descriptions.insert(cl.clone(), first_line.to_string());
+        }
     }
     
-    // Check if CL exists and get description
-    match perforce::get_change_description(cl_number)? {
+    // Show interactive selector
+    let selection = if !options.is_empty() {
+        interactive_select_with_desc(&options, &cl_descriptions)?
+    } else {
+        None
+    };
+    
+    let cl_number = match selection {
         None => {
-            println!("Error: CL {} does not exist", cl_number);
+            println!("Cancelled.");
             return Ok(());
         }
-        Some(desc) => {
-            println!("\nCL {} found:", cl_number);
-            let first_line = desc.lines().next().unwrap_or("(no description)");
-            println!("Description: {}", first_line);
+        Some(s) if s == "[Enter CL number manually]" => {
+            // Manual entry
+            println!("\nEnter CL number to unshelve:");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let cl = input.trim();
+            
+            if cl.is_empty() {
+                println!("Error: No CL number provided");
+                return Ok(());
+            }
+            
+            // Validate it's a number
+            if cl.parse::<i64>().is_err() {
+                println!("Error: Invalid CL number '{}'", cl);
+                return Ok(());
+            }
+            
+            // Check if CL exists
+            match perforce::get_change_description(cl)? {
+                None => {
+                    println!("Error: CL {} does not exist", cl);
+                    return Ok(());
+                }
+                Some(desc) => {
+                    println!("\nCL {} found:", cl);
+                    let first_line = desc.lines().next().unwrap_or("(no description)");
+                    println!("Description: {}", first_line);
+                }
+            }
+            
+            cl.to_string()
+        }
+        Some(cl) => cl,
+    };
+    
+    // Check if CL belongs to a different client
+    let source_cl = cl_number.clone();
+    let mut dest_cl = source_cl.clone();
+    
+    let current_client = perforce::get_current_client()?;
+    let cl_client = perforce::get_changelist_client(&source_cl)?;
+    
+    if let Some(cl_client_name) = cl_client {
+        if cl_client_name != current_client {
+            println!("{}", format!("\nWarning: CL {} belongs to a different client: {}", 
+                source_cl, cl_client_name).bright_yellow());
+            println!("{}", format!("Your current client: {}", current_client).bright_cyan());
+            println!("\nDo you want to unshelve to a different CL? (y/n)");
+            
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let response = input.trim().to_lowercase();
+            
+            if response == "y" || response == "yes" {
+                // Get all CLs for selection
+                let opened = perforce::get_opened_files()?;
+                let mut map: HashMap<String, Vec<perforce::OpenedFile>> = HashMap::new();
+                for f in opened {
+                    map.entry(f.changelist.clone()).or_default().push(f);
+                }
+                
+                let mut all_cls: Vec<String> = map.keys().cloned().collect();
+                all_cls.sort();
+                
+                // Add "create new CL" option
+                all_cls.insert(0, "[Create new CL]".to_string());
+                
+                // Fetch descriptions
+                let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+                for cl in &all_cls {
+                    if cl == "[Create new CL]" {
+                        continue;
+                    }
+                    if let Ok(Some(desc)) = perforce::get_change_description(cl) {
+                        let first_line = desc.lines().next().unwrap_or("").trim();
+                        cl_descriptions.insert(cl.clone(), first_line.to_string());
+                    }
+                }
+                
+                println!("\nSelect destination CL:");
+                println!();
+                
+                match interactive_select_with_desc(&all_cls, &cl_descriptions)? {
+                    None => {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                    Some(s) if s == "[Create new CL]" => {
+                        let new_cl = perforce::create_changelist()?;
+                        println!("Created new CL: {}", new_cl);
+                        dest_cl = new_cl;
+                    }
+                    Some(cl) => {
+                        dest_cl = cl;
+                    }
+                }
+            }
         }
     }
     
     // Unshelve the files
-    println!("\nUnshelving CL {}...", cl_number);
-    match perforce::unshelve_changelist(cl_number) {
-        Ok(_) => {
-            println!("✓ Successfully unshelved files from CL {}", cl_number);
+    if source_cl == dest_cl {
+        println!("\nUnshelving CL {}...", source_cl);
+        match perforce::unshelve_changelist(&source_cl) {
+            Ok(_) => {
+                add_tracked_cl(&source_cl)?;
+                println!("✓ Successfully unshelved files from CL {}", source_cl);
+            }
+            Err(e) => {
+                eprintln!("Error unshelving: {}", e);
+                return Err(e);
+            }
         }
-        Err(e) => {
-            eprintln!("Error unshelving: {}", e);
-            return Err(e);
+        
+        // Reopen files to the same CL
+        println!("\nReopening unshelved files to CL {}...", source_cl);
+        
+        let opened = perforce::get_opened_files()?;
+        let default_files: Vec<_> = opened
+            .iter()
+            .filter(|f| f.changelist == "default")
+            .collect();
+        
+        if default_files.is_empty() {
+            println!("No files found in default changelist to reopen");
+            return Ok(());
         }
-    }
-    
-    // Reopen files to the same CL
-    println!("\nReopening unshelved files to CL {}...", cl_number);
-    
-    // Get all opened files
-    let opened = perforce::get_opened_files()?;
-    
-    // Filter files that are in the default changelist (just unshelved)
-    let default_files: Vec<_> = opened
-        .iter()
-        .filter(|f| f.changelist == "default")
-        .collect();
-    
-    if default_files.is_empty() {
-        println!("No files found in default changelist to reopen");
-        return Ok(());
-    }
-    
-    println!("Reopening {} file(s) to CL {}...", default_files.len(), cl_number);
-    
-    for file in default_files {
+        
+        println!("Reopening {} file(s) to CL {}...", default_files.len(), source_cl);
+        
+        for file in default_files {
+            let mut cmd = std::process::Command::new("p4");
+            cmd.arg("reopen").arg("-c").arg(&source_cl).arg(&file.depot_file);
+            
+            let output = cmd.output()?;
+            if !output.status.success() {
+                eprintln!("Warning: Failed to reopen {}: {}", 
+                    file.depot_file, 
+                    String::from_utf8_lossy(&output.stderr));
+            } else {
+                println!("✓ {}", file.depot_file);
+            }
+        }
+        
+        println!("\nDone! CL {} is ready for use.", source_cl);
+    } else {
+        // Unshelve directly to a different CL
+        println!("\nUnshelving from CL {} to CL {}...", source_cl, dest_cl);
+        
         let mut cmd = std::process::Command::new("p4");
-        cmd.arg("reopen").arg("-c").arg(cl_number).arg(&file.depot_file);
+        cmd.arg("unshelve")
+            .arg("-s")
+            .arg(&source_cl)
+            .arg("-c")
+            .arg(&dest_cl);
         
         let output = cmd.output()?;
         if !output.status.success() {
-            eprintln!("Warning: Failed to reopen {}: {}", 
-                file.depot_file, 
-                String::from_utf8_lossy(&output.stderr));
-        } else {
-            println!("✓ {}", file.depot_file);
+            let err = String::from_utf8_lossy(&output.stderr);
+            eprintln!("Error unshelving: {}", err);
+            return Err(anyhow::anyhow!("Failed to unshelve: {}", err));
         }
+        
+        add_tracked_cl(&source_cl)?;
+        add_tracked_cl(&dest_cl)?;
+        println!("✓ Successfully unshelved files from CL {} to CL {}", source_cl, dest_cl);
+        println!("\nDone! CL {} is ready for use.", dest_cl);
     }
-    
-    println!("\nDone! CL {} is ready for use.", cl_number);
     
     Ok(())
 }
@@ -938,6 +1092,7 @@ fn cmd_shelve() -> Result<()> {
         .output()?;
     
     if output.status.success() {
+        add_tracked_cl(&selected_cl)?;
         println!("\n{}", "✓ Successfully shelved files!".bright_green());
         print!("{}", String::from_utf8_lossy(&output.stdout));
     } else {
@@ -1167,6 +1322,68 @@ fn cmd_gdeinit() -> Result<()> {
     Ok(())
 }
 
+fn cmd_cls() -> Result<()> {
+    // Get tracked CLs from config
+    let tracked_cls = read_tracked_cls()?;
+    
+    // Get currently opened files
+    let opened = perforce::get_opened_files()?;
+    
+    // Build a map of CL -> file count
+    let mut cl_file_count: HashMap<String, usize> = HashMap::new();
+    for file in &opened {
+        *cl_file_count.entry(file.changelist.clone()).or_insert(0) += 1;
+    }
+    
+    // Combine tracked CLs with currently opened CLs
+    let mut all_cls: std::collections::HashSet<String> = tracked_cls.iter().cloned().collect();
+    for cl in cl_file_count.keys() {
+        if cl != "default" {
+            all_cls.insert(cl.clone());
+        }
+    }
+    
+    let mut cls: Vec<String> = all_cls.into_iter().collect();
+    
+    // Sort: numeric ascending
+    cls.sort_by(|a, b| {
+        match (a.parse::<i64>(), b.parse::<i64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            _ => a.cmp(b),
+        }
+    });
+    
+    if cls.is_empty() {
+        println!("{}", "No tracked changelists found.".bright_yellow());
+        println!("Create, shelve, or unshelve changelists to track them.");
+        return Ok(());
+    }
+    
+    // Fetch descriptions for each CL
+    let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    for cl in &cls {
+        if let Ok(Some(desc)) = perforce::get_change_description(cl) {
+            let first_line = desc.lines().next().unwrap_or("").trim();
+            cl_descriptions.insert(cl.clone(), first_line.to_string());
+        }
+    }
+    
+    println!("Tracked changelists:");
+    println!();
+    
+    // Use interactive selector with delete capability
+    match interactive_cl_select_with_delete(&cls, &cl_descriptions, &cl_file_count)? {
+        None => {
+            println!("No action taken.");
+        }
+        Some(_) => {
+            // Action was already handled in the interactive selector
+        }
+    }
+    
+    Ok(())
+}
+
 // Enum to represent items in the selection list
 #[derive(Clone)]
 enum SelectItem {
@@ -1219,20 +1436,17 @@ fn interactive_file_select(
     let needed_lines = 5 + items.len();
     let available_lines = (term_height - initial_pos.1) as usize;
     
-    // If we don't have enough space, move cursor up
-    let start_pos = if available_lines < needed_lines {
-        // Move cursor to a position where we have enough space
-        let new_row = term_height.saturating_sub(needed_lines as u16 + 1);
-        execute!(
-            std::io::stdout(), 
-            cursor::MoveTo(0, new_row),
-            terminal::Clear(ClearType::FromCursorDown)
-        )?;
+    // If we don't have enough space, scroll the terminal up by printing newlines
+    if available_lines < needed_lines {
+        let lines_to_scroll = needed_lines - available_lines;
+        for _ in 0..lines_to_scroll {
+            println!();
+        }
         std::io::stdout().flush()?;
-        cursor::position()?
-    } else {
-        initial_pos
-    };
+    }
+    
+    // Get the current position after scrolling
+    let start_pos = cursor::position()?;
     
     // Enable raw mode
     terminal::enable_raw_mode()?;
@@ -1394,6 +1608,180 @@ fn interactive_file_select(
     result
 }
 
+fn interactive_cl_select_with_delete(
+    items: &[String],
+    descriptions: &HashMap<String, String>,
+    file_counts: &HashMap<String, usize>,
+) -> Result<Option<String>> {
+    let mut selected_idx = 0usize;
+    
+    // Get terminal size and current cursor position
+    let (_term_width, term_height) = terminal::size()?;
+    let initial_pos = cursor::position()?;
+    
+    // Calculate how many lines we need (header + blank + items)
+    let needed_lines = 3 + items.len();
+    let available_lines = (term_height - initial_pos.1) as usize;
+    
+    // If we don't have enough space, scroll the terminal up by printing newlines
+    if available_lines < needed_lines {
+        let lines_to_scroll = needed_lines - available_lines;
+        for _ in 0..lines_to_scroll {
+            println!();
+        }
+        std::io::stdout().flush()?;
+    }
+    
+    // Get the current position after scrolling
+    let start_pos = cursor::position()?;
+    
+    // Enable raw mode
+    terminal::enable_raw_mode()?;
+    
+    let result = (|| -> Result<Option<String>> {
+        loop {
+            // Move cursor to start position and clear from here down
+            execute!(
+                std::io::stdout(),
+                cursor::MoveTo(start_pos.0, start_pos.1),
+                terminal::Clear(ClearType::FromCursorDown)
+            )?;
+            std::io::stdout().flush()?;
+            
+            // Display header
+            print!("Tracked CLs (↑/↓ to navigate, 'd' to delete, Esc/q to cancel):\r\n\r\n");
+            
+            // Display items
+            for (idx, item) in items.iter().enumerate() {
+                let file_count = file_counts.get(item).copied().unwrap_or(0);
+                let desc = descriptions.get(item).map(|s| s.as_str()).unwrap_or("");
+                
+                let display = if file_count == 0 {
+                    // Empty CL - show in gray
+                    if desc.is_empty() {
+                        format!("CL {} [empty]", item).bright_black().to_string()
+                    } else {
+                        format!("CL {} - {} [empty]", item, desc).bright_black().to_string()
+                    }
+                } else {
+                    // CL with files
+                    if desc.is_empty() {
+                        format!("CL {} — {} file(s)", item, file_count)
+                    } else {
+                        format!("CL {} - {} — {} file(s)", item, desc, file_count)
+                    }
+                };
+                
+                if idx == selected_idx {
+                    print!("  {}  {}\r\n", "→".bright_green(), display.bright_green().bold());
+                } else {
+                    print!("     {}\r\n", display);
+                }
+            }
+            
+            std::io::stdout().flush()?;
+            
+            // Read key event
+            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                match code {
+                    KeyCode::Up => {
+                        if selected_idx > 0 {
+                            selected_idx -= 1;
+                        } else {
+                            selected_idx = items.len() - 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if selected_idx < items.len() - 1 {
+                            selected_idx += 1;
+                        } else {
+                            selected_idx = 0;
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        let cl = &items[selected_idx];
+                        terminal::disable_raw_mode()?;
+                        
+                        // Clear the menu
+                        execute!(
+                            std::io::stdout(),
+                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            terminal::Clear(ClearType::FromCursorDown)
+                        )?;
+                        
+                        // Ask for confirmation
+                        println!("{}", format!("Delete CL {}?", cl).bright_yellow().bold());
+                        if let Some(desc) = descriptions.get(cl) {
+                            println!("Description: {}", desc.bright_cyan());
+                        }
+                        
+                        let file_count = file_counts.get(cl).copied().unwrap_or(0);
+                        if file_count > 0 {
+                            println!("{}", format!("This will revert {} opened file(s).", file_count).bright_red());
+                        }
+                        
+                        println!("\nType 'yes' to confirm deletion:");
+                        
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input)?;
+                        let answer = input.trim().to_lowercase();
+                        
+                        if answer == "yes" {
+                            // Revert all opened files in this CL
+                            if file_count > 0 {
+                                println!("\nReverting files...");
+                                let opened = perforce::get_opened_files()?;
+                                let files_in_cl: Vec<_> = opened.iter()
+                                    .filter(|f| &f.changelist == cl)
+                                    .collect();
+                                
+                                for file in files_in_cl {
+                                    println!("  Reverting: {}", file.depot_file);
+                                    let output = std::process::Command::new("p4")
+                                        .arg("revert")
+                                        .arg(&file.depot_file)
+                                        .output()?;
+                                    
+                                    if !output.status.success() {
+                                        eprintln!("    {}", "Error:".bright_red());
+                                        eprintln!("    {}", String::from_utf8_lossy(&output.stderr));
+                                    }
+                                }
+                            }
+                            
+                            // Remove from tracked CLs
+                            remove_tracked_cl(cl)?;
+                            
+                            println!("\n{}", format!("✓ CL {} deleted and removed from tracking.", cl).bright_green());
+                            return Ok(Some(cl.clone()));
+                        } else {
+                            println!("Deletion cancelled.");
+                            // Re-enable raw mode and continue
+                            terminal::enable_raw_mode()?;
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        terminal::disable_raw_mode()?;
+                        execute!(
+                            std::io::stdout(),
+                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            terminal::Clear(ClearType::FromCursorDown)
+                        )?;
+                        println!("Cancelled.");
+                        return Ok(None);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })();
+    
+    // Always disable raw mode on exit
+    terminal::disable_raw_mode()?;
+    
+    result
+}
+
 fn interactive_select_with_desc(items: &[String], descriptions: &HashMap<String, String>) -> Result<Option<String>> {
     let mut selected_idx = 0usize;
     
@@ -1405,20 +1793,17 @@ fn interactive_select_with_desc(items: &[String], descriptions: &HashMap<String,
     let needed_lines = 3 + items.len();
     let available_lines = (term_height - initial_pos.1) as usize;
     
-    // If we don't have enough space, move cursor up or clear screen
-    let start_pos = if available_lines < needed_lines {
-        // Move cursor to a position where we have enough space
-        let new_row = term_height.saturating_sub(needed_lines as u16 + 1);
-        execute!(
-            std::io::stdout(), 
-            cursor::MoveTo(0, new_row),
-            terminal::Clear(ClearType::FromCursorDown)
-        )?;
+    // If we don't have enough space, scroll the terminal up by printing newlines
+    if available_lines < needed_lines {
+        let lines_to_scroll = needed_lines - available_lines;
+        for _ in 0..lines_to_scroll {
+            println!();
+        }
         std::io::stdout().flush()?;
-        cursor::position()?
-    } else {
-        initial_pos
-    };
+    }
+    
+    // Get the current position after scrolling
+    let start_pos = cursor::position()?;
     
     // Enable raw mode
     terminal::enable_raw_mode()?;
@@ -1586,4 +1971,52 @@ where
     if is_last {
     println!("{}", colorize(&bot));
     }
+}
+
+// ============================================================================
+// Config file management for tracking CLs
+// ============================================================================
+
+fn get_config_path() -> Result<std::path::PathBuf> {
+    let home = std::env::var("HOME")?;
+    Ok(std::path::PathBuf::from(home).join(".pconfig"))
+}
+
+fn read_tracked_cls() -> Result<Vec<String>> {
+    let config_path = get_config_path()?;
+    if !config_path.exists() {
+        return Ok(Vec::new());
+    }
+    
+    let content = std::fs::read_to_string(config_path)?;
+    let cls: Vec<String> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .collect();
+    
+    Ok(cls)
+}
+
+fn write_tracked_cls(cls: &[String]) -> Result<()> {
+    let config_path = get_config_path()?;
+    let content = cls.join("\n");
+    std::fs::write(config_path, content)?;
+    Ok(())
+}
+
+fn add_tracked_cl(cl: &str) -> Result<()> {
+    let mut cls = read_tracked_cls()?;
+    if !cls.contains(&cl.to_string()) {
+        cls.push(cl.to_string());
+        write_tracked_cls(&cls)?;
+    }
+    Ok(())
+}
+
+fn remove_tracked_cl(cl: &str) -> Result<()> {
+    let mut cls = read_tracked_cls()?;
+    cls.retain(|c| c != cl);
+    write_tracked_cls(&cls)?;
+    Ok(())
 }

@@ -192,6 +192,61 @@ pub fn unshelve_changelist(cl_number: &str) -> Result<()> {
     Ok(())
 }
 
+/// Get the client (workspace) name for a changelist
+pub fn get_changelist_client(cl_number: &str) -> Result<Option<String>> {
+    let output = Command::new("p4")
+        .arg("change")
+        .arg("-o")
+        .arg(cl_number)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to execute p4 change -o {}", cl_number))?;
+    
+    if !output.status.success() {
+        return Ok(None);
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    for line in stdout.lines() {
+        if line.starts_with("Client:") {
+            if let Some(client) = line.split_whitespace().nth(1) {
+                return Ok(Some(client.to_string()));
+            }
+        }
+    }
+    
+    Ok(None)
+}
+
+/// Get the current client (workspace) name
+pub fn get_current_client() -> Result<String> {
+    let output = Command::new("p4")
+        .arg("client")
+        .arg("-o")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("Failed to execute p4 client -o")?;
+    
+    if !output.status.success() {
+        anyhow::bail!("Failed to get current client");
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    for line in stdout.lines() {
+        if line.starts_with("Client:") {
+            if let Some(client) = line.split_whitespace().nth(1) {
+                return Ok(client.to_string());
+            }
+        }
+    }
+    
+    anyhow::bail!("Could not determine current client")
+}
+
 /// Get the depot path for a local file using p4 where
 pub fn get_depot_path(local_path: &str) -> Result<Option<String>> {
     // Try to canonicalize the path first (resolve relative paths, symlinks, etc.)
