@@ -327,11 +327,22 @@ fn cmd_reopen() -> Result<()> {
         })
         .collect();
     
+    // Fetch descriptions for each CL
+    let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    for cl in &cls {
+        if cl != "default" {
+            if let Ok(Some(desc)) = perforce::get_change_description(cl) {
+                let first_line = desc.lines().next().unwrap_or("").trim();
+                cl_descriptions.insert(cl.clone(), first_line.to_string());
+            }
+        }
+    }
+    
     // Print newline to establish starting position
     println!();
     
     // Interactive file selector
-    let selected_files = interactive_file_select(&opened, &cl_to_color)?;
+    let selected_files = interactive_file_select(&opened, &cl_to_color, &cl_descriptions)?;
     
     if selected_files.is_empty() {
         println!("No files selected.");
@@ -517,11 +528,22 @@ fn cmd_revert() -> Result<()> {
         })
         .collect();
     
+    // Fetch descriptions for each CL
+    let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    for cl in &cls {
+        if cl != "default" {
+            if let Ok(Some(desc)) = perforce::get_change_description(cl) {
+                let first_line = desc.lines().next().unwrap_or("").trim();
+                cl_descriptions.insert(cl.clone(), first_line.to_string());
+            }
+        }
+    }
+    
     // Print newline to establish starting position
     println!();
     
     // Interactive file selector
-    let selected_files = interactive_file_select(&opened, &cl_to_color)?;
+    let selected_files = interactive_file_select(&opened, &cl_to_color, &cl_descriptions)?;
     
     if selected_files.is_empty() {
         println!("No files selected.");
@@ -1394,6 +1416,7 @@ enum SelectItem {
 fn interactive_file_select(
     files: &[perforce::OpenedFile],
     cl_to_color: &HashMap<String, fn(&str) -> String>,
+    cl_descriptions: &HashMap<String, String>,
 ) -> Result<Vec<perforce::OpenedFile>> {
     // Group files by changelist
     let mut cl_to_files: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1477,8 +1500,14 @@ fn interactive_file_select(
                             "[ ]"
                         };
                         
-                        let line = format!("{}  {} 📋 CL {} — {} file(s)", 
-                            arrow, checkbox, cl_label, file_indices.len());
+                        // Format with description if available
+                        let line = if let Some(desc) = cl_descriptions.get(cl) {
+                            format!("{}  {} 📋 CL {} - {} — {} file(s)", 
+                                arrow, checkbox, cl_label, desc, file_indices.len())
+                        } else {
+                            format!("{}  {} 📋 CL {} — {} file(s)", 
+                                arrow, checkbox, cl_label, file_indices.len())
+                        };
                         
                         if idx == selected_idx {
                             print!("{}\r\n", color(&line).bold().to_string());
