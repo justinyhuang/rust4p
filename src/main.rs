@@ -1428,35 +1428,22 @@ fn interactive_file_select(
     let mut selected_idx = 0usize;
     let mut selected_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
     
-    // Get terminal size and current cursor position
-    let (_term_width, term_height) = terminal::size()?;
-    let initial_pos = cursor::position()?;
-    
-    // Calculate how many lines we need (header + blank + items + blank + footer)
-    let needed_lines = 5 + items.len();
-    let available_lines = (term_height - initial_pos.1) as usize;
-    
-    // If we don't have enough space, scroll the terminal up by printing newlines
-    if available_lines < needed_lines {
-        let lines_to_scroll = needed_lines - available_lines;
-        for _ in 0..lines_to_scroll {
-            println!();
-        }
-        std::io::stdout().flush()?;
-    }
-    
-    // Get the current position after scrolling
+    // Capture the starting position (before entering raw mode)
     let start_pos = cursor::position()?;
     
     // Enable raw mode
     terminal::enable_raw_mode()?;
     
     let result = (|| -> Result<Vec<perforce::OpenedFile>> {
+        // Track the actual rendering position (may differ from start_pos after first render)
+        let mut render_pos = start_pos;
+        let mut first_render = true;
+        
         loop {
-            // Move cursor to start position and clear from here down
+            // Move cursor to render position and clear from here down
             execute!(
                 std::io::stdout(),
-                cursor::MoveTo(start_pos.0, start_pos.1),
+                cursor::MoveTo(render_pos.0, render_pos.1),
                 terminal::Clear(ClearType::FromCursorDown)
             )?;
             std::io::stdout().flush()?;
@@ -1522,6 +1509,26 @@ fn interactive_file_select(
             
             std::io::stdout().flush()?;
             
+            // After first render, adjust render_pos if scrolling occurred
+            if first_render {
+                let end_pos = cursor::position()?;
+                let lines_rendered = 2 + items.len() + 2; // header + blank + items + blank + footer
+                
+                // Calculate where we should have ended up (cursor is after last line)
+                let expected_end_row = render_pos.1 + lines_rendered as u16;
+                
+                // If actual position is different, terminal scrolled
+                if end_pos.1 != expected_end_row {
+                    // Recalculate render_pos based on where we actually ended
+                    if end_pos.1 >= lines_rendered as u16 {
+                        render_pos.1 = end_pos.1 - lines_rendered as u16;
+                    } else {
+                        render_pos.1 = 0;
+                    }
+                }
+                first_render = false;
+            }
+            
             // Read key event
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
@@ -1575,7 +1582,7 @@ fn interactive_file_select(
                         // Clear the menu
                         execute!(
                             std::io::stdout(),
-                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            cursor::MoveTo(render_pos.0, render_pos.1),
                             terminal::Clear(ClearType::FromCursorDown)
                         )?;
                         
@@ -1590,7 +1597,7 @@ fn interactive_file_select(
                         // Clear the menu
                         execute!(
                             std::io::stdout(),
-                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            cursor::MoveTo(render_pos.0, render_pos.1),
                             terminal::Clear(ClearType::FromCursorDown)
                         )?;
                         println!("Cancelled.");
@@ -1615,35 +1622,22 @@ fn interactive_cl_select_with_delete(
 ) -> Result<Option<String>> {
     let mut selected_idx = 0usize;
     
-    // Get terminal size and current cursor position
-    let (_term_width, term_height) = terminal::size()?;
-    let initial_pos = cursor::position()?;
-    
-    // Calculate how many lines we need (header + blank + items)
-    let needed_lines = 3 + items.len();
-    let available_lines = (term_height - initial_pos.1) as usize;
-    
-    // If we don't have enough space, scroll the terminal up by printing newlines
-    if available_lines < needed_lines {
-        let lines_to_scroll = needed_lines - available_lines;
-        for _ in 0..lines_to_scroll {
-            println!();
-        }
-        std::io::stdout().flush()?;
-    }
-    
-    // Get the current position after scrolling
+    // Capture the starting position (before entering raw mode)
     let start_pos = cursor::position()?;
     
     // Enable raw mode
     terminal::enable_raw_mode()?;
     
     let result = (|| -> Result<Option<String>> {
+        // Track the actual rendering position (may differ from start_pos after first render)
+        let mut render_pos = start_pos;
+        let mut first_render = true;
+        
         loop {
-            // Move cursor to start position and clear from here down
+            // Move cursor to render position and clear from here down
             execute!(
                 std::io::stdout(),
-                cursor::MoveTo(start_pos.0, start_pos.1),
+                cursor::MoveTo(render_pos.0, render_pos.1),
                 terminal::Clear(ClearType::FromCursorDown)
             )?;
             std::io::stdout().flush()?;
@@ -1681,6 +1675,26 @@ fn interactive_cl_select_with_delete(
             
             std::io::stdout().flush()?;
             
+            // After first render, adjust render_pos if scrolling occurred
+            if first_render {
+                let end_pos = cursor::position()?;
+                let lines_rendered = 2 + items.len(); // header + blank + items
+                
+                // Calculate where we should have ended up (cursor is after last line)
+                let expected_end_row = render_pos.1 + lines_rendered as u16;
+                
+                // If actual position is different, terminal scrolled
+                if end_pos.1 != expected_end_row {
+                    // Recalculate render_pos based on where we actually ended
+                    if end_pos.1 >= lines_rendered as u16 {
+                        render_pos.1 = end_pos.1 - lines_rendered as u16;
+                    } else {
+                        render_pos.1 = 0;
+                    }
+                }
+                first_render = false;
+            }
+            
             // Read key event
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
@@ -1705,7 +1719,7 @@ fn interactive_cl_select_with_delete(
                         // Clear the menu
                         execute!(
                             std::io::stdout(),
-                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            cursor::MoveTo(render_pos.0, render_pos.1),
                             terminal::Clear(ClearType::FromCursorDown)
                         )?;
                         
@@ -1764,7 +1778,7 @@ fn interactive_cl_select_with_delete(
                         terminal::disable_raw_mode()?;
                         execute!(
                             std::io::stdout(),
-                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            cursor::MoveTo(render_pos.0, render_pos.1),
                             terminal::Clear(ClearType::FromCursorDown)
                         )?;
                         println!("Cancelled.");
@@ -1785,35 +1799,22 @@ fn interactive_cl_select_with_delete(
 fn interactive_select_with_desc(items: &[String], descriptions: &HashMap<String, String>) -> Result<Option<String>> {
     let mut selected_idx = 0usize;
     
-    // Get terminal size and current cursor position
-    let (_term_width, term_height) = terminal::size()?;
-    let initial_pos = cursor::position()?;
-    
-    // Calculate how many lines we need (header + blank + items)
-    let needed_lines = 3 + items.len();
-    let available_lines = (term_height - initial_pos.1) as usize;
-    
-    // If we don't have enough space, scroll the terminal up by printing newlines
-    if available_lines < needed_lines {
-        let lines_to_scroll = needed_lines - available_lines;
-        for _ in 0..lines_to_scroll {
-            println!();
-        }
-        std::io::stdout().flush()?;
-    }
-    
-    // Get the current position after scrolling
+    // Capture the starting position (before entering raw mode)
     let start_pos = cursor::position()?;
     
     // Enable raw mode
     terminal::enable_raw_mode()?;
     
     let result = (|| -> Result<Option<String>> {
+        // Track the actual rendering position (may differ from start_pos after first render)
+        let mut render_pos = start_pos;
+        let mut first_render = true;
+        
         loop {
-            // Move cursor to start position and clear from here down
+            // Move cursor to render position and clear from here down
             execute!(
                 std::io::stdout(),
-                cursor::MoveTo(start_pos.0, start_pos.1),
+                cursor::MoveTo(render_pos.0, render_pos.1),
                 terminal::Clear(ClearType::FromCursorDown)
             )?;
             std::io::stdout().flush()?;
@@ -1845,6 +1846,26 @@ fn interactive_select_with_desc(items: &[String], descriptions: &HashMap<String,
             
             std::io::stdout().flush()?;
             
+            // After first render, adjust render_pos if scrolling occurred
+            if first_render {
+                let end_pos = cursor::position()?;
+                let lines_rendered = 2 + items.len(); // header + blank + items
+                
+                // Calculate where we should have ended up (cursor is after last line)
+                let expected_end_row = render_pos.1 + lines_rendered as u16;
+                
+                // If actual position is different, terminal scrolled
+                if end_pos.1 != expected_end_row {
+                    // Recalculate render_pos based on where we actually ended
+                    if end_pos.1 >= lines_rendered as u16 {
+                        render_pos.1 = end_pos.1 - lines_rendered as u16;
+                    } else {
+                        render_pos.1 = 0;
+                    }
+                }
+                first_render = false;
+            }
+            
             // Read key event
             if let Event::Key(KeyEvent { code, .. }) = event::read()? {
                 match code {
@@ -1870,7 +1891,7 @@ fn interactive_select_with_desc(items: &[String], descriptions: &HashMap<String,
                         // Clear the menu and print final selection
                         execute!(
                             std::io::stdout(),
-                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            cursor::MoveTo(render_pos.0, render_pos.1),
                             terminal::Clear(ClearType::FromCursorDown)
                         )?;
                         println!("Selected: {}", if result == "default" {
@@ -1885,7 +1906,7 @@ fn interactive_select_with_desc(items: &[String], descriptions: &HashMap<String,
                         // Clear the menu
                         execute!(
                             std::io::stdout(),
-                            cursor::MoveTo(start_pos.0, start_pos.1),
+                            cursor::MoveTo(render_pos.0, render_pos.1),
                             terminal::Clear(ClearType::FromCursorDown)
                         )?;
                         println!("Cancelled.");
