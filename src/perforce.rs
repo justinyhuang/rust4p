@@ -29,12 +29,7 @@ fn run(cmd: &str, args: &[&str]) -> Result<String> {
 
 /// Prefer tagged output for robust parsing.
 pub fn get_opened_files() -> Result<Vec<OpenedFile>> {
-    // `p4 -ztag opened` produces blocks like:
-    // ... depotFile //depot/path/file
-    // ... clientFile /work/path/file
-    // ... rev 27
-    // ... action edit
-    // ... change 12345   (or) ... change default
+    // `p4 -ztag opened` produces blocks with tagged output fields
     let stdout = run("p4", &["-ztag", "opened"])?;
     let line_re = Regex::new(r"^\.\.\.\s+(\w+)\s+(.+)$").unwrap();
 
@@ -173,6 +168,58 @@ pub fn create_changelist() -> Result<String> {
     }
 }
 
+/// Get shelved files from a changelist
+pub fn get_shelved_files(cl_number: &str) -> Result<Vec<OpenedFile>> {
+    let stdout = run("p4", &["-ztag", "describe", "-S", "-s", cl_number])?;
+    let line_re = Regex::new(r"^\.\.\.\s+(\w+?)(\d*)\s+(.+)$").unwrap();
+    
+    let mut files_map: std::collections::HashMap<usize, (Option<String>, Option<String>)> = std::collections::HashMap::new();
+    
+    for line in stdout.lines() {
+        if let Some(cap) = line_re.captures(line) {
+            let key = &cap[1];
+            let index_str = &cap[2];
+            let val = cap[3].to_string();
+            
+            let index = if index_str.is_empty() {
+                0
+            } else {
+                index_str.parse::<usize>().unwrap_or(0)
+            };
+            
+            let entry = files_map.entry(index).or_insert((None, None));
+            
+            match key {
+                "depotFile" => {
+                    entry.0 = Some(val);
+                }
+                "action" => {
+                    entry.1 = Some(val);
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    // Convert to vector of OpenedFile
+    let mut files = Vec::new();
+    let mut indices: Vec<_> = files_map.keys().copied().collect();
+    indices.sort();
+    
+    for idx in indices {
+        if let Some((Some(file), Some(action))) = files_map.get(&idx) {
+            files.push(OpenedFile {
+                changelist: cl_number.to_string(),
+                depot_file: file.clone(),
+                action: action.clone(),
+                workrev: None,
+            });
+        }
+    }
+    
+    Ok(files)
+}
+
 /// Unshelve files from a changelist
 pub fn unshelve_changelist(cl_number: &str) -> Result<()> {
     let output = Command::new("p4")
@@ -183,6 +230,31 @@ pub fn unshelve_changelist(cl_number: &str) -> Result<()> {
         .stderr(Stdio::piped())
         .output()
         .with_context(|| format!("Failed to unshelve CL {}", cl_number))?;
+    
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to unshelve: {}", err);
+    }
+    
+    Ok(())
+}
+
+/// Unshelve specific files from a changelist
+pub fn unshelve_files(cl_number: &str, files: &[String]) -> Result<()> {
+    let mut cmd = Command::new("p4");
+    cmd.arg("unshelve")
+        .arg("-s")
+        .arg(cl_number);
+    
+    for file in files {
+        cmd.arg(file);
+    }
+    
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to unshelve files from CL {}", cl_number))?;
     
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -293,4 +365,46 @@ pub fn get_depot_path(local_path: &str) -> Result<Option<String>> {
     eprintln!("Debug: Could not parse depot path from p4 where output");
     eprintln!("Debug: stdout: {}", stdout.trim());
     Ok(None)
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnotateLine {
+    pub cl_number: String,
+    pub username: String,
+    pub date: String,
+    pub line_content: String,
+}
+
+/// Get annotate information for a file
+pub fn get_annotate(file_path: &str) -> Result<Vec<AnnotateLine>> {
+    // Use -a -u flags: -a shows changelist ranges, -u adds user and date
+    // Use -c to show changelist numbers instead of revision numbers
+    // Use -I to follow all integrations
+    let stdout = run("p4", &["annotate", "-a", "-u", "-c", "-I", "-q", file_path])?;
+    
+    // Format with -a -u flags: <cl-range>: <user> <date> <line>
+    // Important: Use single space after date to preserve indentation in line content
+    let line_re = Regex::new(r"^(\d+(?:-\d+)?):\s+(\S+)\s+(\d{4}/\d{2}/\d{2}) (.*)$").unwrap();
+    
+    let mut lines = Vec::new();
+    for line in stdout.lines() {
+        if let Some(cap) = line_re.captures(line) {
+            lines.push(AnnotateLine {
+                cl_number: cap[1].to_string(),
+                username: cap[2].to_string(),
+                date: cap[3].to_string(),
+                line_content: cap[4].to_string(),
+            });
+        } else {
+            // If the line doesn't match, it might be a continuation or malformed
+            lines.push(AnnotateLine {
+                cl_number: "?".to_string(),
+                username: "?".to_string(),
+                date: "?".to_string(),
+                line_content: line.to_string(),
+            });
+        }
+    }
+    
+    Ok(lines)
 }

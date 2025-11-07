@@ -58,6 +58,12 @@ enum Commands {
     /// Manage tracked changelists.
     #[command(name = "cls")]
     Cls,
+    /// Show annotated file with CL, user, date, and line content.
+    #[command(name = "annotate")]
+    Annotate {
+        /// Path to the file to annotate
+        file: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -76,6 +82,7 @@ fn main() -> Result<()> {
         Commands::Ginit => cmd_ginit()?,
         Commands::Gdeinit => cmd_gdeinit()?,
         Commands::Cls => cmd_cls()?,
+        Commands::Annotate { file } => cmd_annotate(&file)?,
     }
     Ok(())
 }
@@ -342,7 +349,7 @@ fn cmd_reopen() -> Result<()> {
     println!();
     
     // Interactive file selector
-    let selected_files = interactive_file_select(&opened, &cl_to_color, &cl_descriptions)?;
+    let selected_files = interactive_file_select(&opened, &cl_to_color, &cl_descriptions, false)?;
     
     if selected_files.is_empty() {
         println!("No files selected.");
@@ -543,7 +550,7 @@ fn cmd_revert() -> Result<()> {
     println!();
     
     // Interactive file selector
-    let selected_files = interactive_file_select(&opened, &cl_to_color, &cl_descriptions)?;
+    let selected_files = interactive_file_select(&opened, &cl_to_color, &cl_descriptions, false)?;
     
     if selected_files.is_empty() {
         println!("No files selected.");
@@ -977,13 +984,43 @@ fn cmd_unshelve() -> Result<()> {
         }
     }
     
-    // Unshelve the files
+    // Get shelved files
+    let shelved_files = perforce::get_shelved_files(&source_cl)?;
+    
+    if shelved_files.is_empty() {
+        println!("No shelved files found in CL {}", source_cl);
+        return Ok(());
+    }
+    
+    // Show files for selection
+    println!("\nSelect files to unshelve from CL {}:", source_cl);
+    println!();
+    
+    // Create a simple color map (all files are from same CL)
+    let palette: Vec<fn(&str) -> String> = vec![|s| s.blue().to_string()];
+    let mut cl_to_color: HashMap<String, fn(&str) -> String> = HashMap::new();
+    cl_to_color.insert(source_cl.clone(), palette[0]);
+    
+    let cl_descriptions: HashMap<String, String> = HashMap::new();
+    
+    // Interactive file selector - all files pre-selected
+    let selected_files = interactive_file_select(&shelved_files, &cl_to_color, &cl_descriptions, true)?;
+    
+    if selected_files.is_empty() {
+        println!("No files selected.");
+        return Ok(());
+    }
+    
+    // Collect depot paths
+    let file_paths: Vec<String> = selected_files.iter().map(|f| f.depot_file.clone()).collect();
+    
+    // Unshelve the selected files
     if source_cl == dest_cl {
-        println!("\nUnshelving CL {}...", source_cl);
-        match perforce::unshelve_changelist(&source_cl) {
+        println!("\nUnshelving {} file(s) from CL {}...", file_paths.len(), source_cl);
+        match perforce::unshelve_files(&source_cl, &file_paths) {
             Ok(_) => {
                 add_tracked_cl(&source_cl)?;
-                println!("✓ Successfully unshelved files from CL {}", source_cl);
+                println!("✓ Successfully unshelved {} file(s) from CL {}", file_paths.len(), source_cl);
             }
             Err(e) => {
                 eprintln!("Error unshelving: {}", e);
@@ -1023,8 +1060,8 @@ fn cmd_unshelve() -> Result<()> {
         
         println!("\nDone! CL {} is ready for use.", source_cl);
     } else {
-        // Unshelve directly to a different CL
-        println!("\nUnshelving from CL {} to CL {}...", source_cl, dest_cl);
+        // Unshelve to a different CL - need to use -c flag
+        println!("\nUnshelving {} file(s) from CL {} to CL {}...", file_paths.len(), source_cl, dest_cl);
         
         let mut cmd = std::process::Command::new("p4");
         cmd.arg("unshelve")
@@ -1032,6 +1069,10 @@ fn cmd_unshelve() -> Result<()> {
             .arg(&source_cl)
             .arg("-c")
             .arg(&dest_cl);
+        
+        for file in &file_paths {
+            cmd.arg(file);
+        }
         
         let output = cmd.output()?;
         if !output.status.success() {
@@ -1042,7 +1083,7 @@ fn cmd_unshelve() -> Result<()> {
         
         add_tracked_cl(&source_cl)?;
         add_tracked_cl(&dest_cl)?;
-        println!("✓ Successfully unshelved files from CL {} to CL {}", source_cl, dest_cl);
+        println!("✓ Successfully unshelved {} file(s) from CL {} to CL {}", file_paths.len(), source_cl, dest_cl);
         println!("\nDone! CL {} is ready for use.", dest_cl);
     }
     
@@ -1417,6 +1458,7 @@ fn interactive_file_select(
     files: &[perforce::OpenedFile],
     cl_to_color: &HashMap<String, fn(&str) -> String>,
     cl_descriptions: &HashMap<String, String>,
+    pre_select_all: bool,
 ) -> Result<Vec<perforce::OpenedFile>> {
     // Group files by changelist
     let mut cl_to_files: HashMap<String, Vec<usize>> = HashMap::new();
@@ -1450,6 +1492,13 @@ fn interactive_file_select(
     
     let mut selected_idx = 0usize;
     let mut selected_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    
+    // Pre-select all files if requested
+    if pre_select_all {
+        for i in 0..files.len() {
+            selected_set.insert(i);
+        }
+    }
     
     // Capture the starting position (before entering raw mode)
     let start_pos = cursor::position()?;
@@ -2069,4 +2118,317 @@ fn remove_tracked_cl(cl: &str) -> Result<()> {
     cls.retain(|c| c != cl);
     write_tracked_cls(&cls)?;
     Ok(())
+}
+
+fn cmd_annotate(file_path: &str) -> Result<()> {
+    // Show loading indicator
+    print!("Loading annotate data");
+    std::io::stdout().flush()?;
+    
+    // Start spinner in a separate thread
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let running_clone = running.clone();
+    
+    let spinner_thread = std::thread::spawn(move || {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut idx = 0;
+        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            print!("\rLoading annotate data {}  ", frames[idx]);
+            std::io::stdout().flush().ok();
+            idx = (idx + 1) % frames.len();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+        print!("\r{}\r", " ".repeat(50)); // Clear the line
+        std::io::stdout().flush().ok();
+    });
+    
+    // Fetch the data
+    let lines = perforce::get_annotate(file_path)?;
+    
+    // Stop spinner
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    spinner_thread.join().ok();
+    
+    if lines.is_empty() {
+        println!("No annotate data for file: {}", file_path);
+        return Ok(());
+    }
+    
+    // Enter raw mode for interactive viewing
+    terminal::enable_raw_mode()?;
+    
+    let mut stdout = std::io::stdout();
+    execute!(stdout, terminal::Clear(ClearType::All), cursor::Hide)?;
+    
+    let result = annotate_viewer(&lines);
+    
+    // Clean up terminal state
+    execute!(stdout, cursor::Show)?;
+    terminal::disable_raw_mode()?;
+    
+    result
+}
+
+fn annotate_viewer(lines: &[perforce::AnnotateLine]) -> Result<()> {
+    let mut top_line = 0;
+    let mut search_query: Option<String> = None;
+    let mut search_matches: Vec<usize> = Vec::new();
+    let mut current_match_idx: Option<usize> = None;
+    
+    loop {
+        let (_, term_height) = terminal::size()?;
+        let visible_lines = (term_height as usize).saturating_sub(2); // Leave space for status bar
+        
+        // Render the visible portion
+        render_annotate_page(lines, top_line, visible_lines, &search_query, &search_matches, current_match_idx)?;
+        
+        // Handle keyboard input
+        if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    top_line = (top_line + visible_lines).min(lines.len().saturating_sub(1));
+                }
+                KeyCode::PageUp => {
+                    top_line = top_line.saturating_sub(visible_lines);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    top_line = (top_line + 1).min(lines.len().saturating_sub(visible_lines));
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    top_line = top_line.saturating_sub(1);
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    top_line = 0;
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    top_line = lines.len().saturating_sub(visible_lines);
+                }
+                KeyCode::Char('/') => {
+                    // Enter search mode
+                    if let Some(query) = prompt_search()? {
+                        search_query = Some(query.to_lowercase());
+                        search_matches = find_search_matches(lines, &search_query.as_ref().unwrap());
+                        current_match_idx = if !search_matches.is_empty() {
+                            Some(0)
+                        } else {
+                            None
+                        };
+                        // Jump to first match
+                        if let Some(0) = current_match_idx {
+                            if !search_matches.is_empty() {
+                                top_line = search_matches[0].saturating_sub(visible_lines / 2);
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('n') => {
+                    // Next match
+                    if let Some(idx) = current_match_idx {
+                        if !search_matches.is_empty() {
+                            let next_idx = (idx + 1) % search_matches.len();
+                            current_match_idx = Some(next_idx);
+                            top_line = search_matches[next_idx].saturating_sub(visible_lines / 2);
+                        }
+                    }
+                }
+                KeyCode::Char('p') | KeyCode::Char('N') => {
+                    // Previous match
+                    if let Some(idx) = current_match_idx {
+                        if !search_matches.is_empty() {
+                            let prev_idx = if idx == 0 { search_matches.len() - 1 } else { idx - 1 };
+                            current_match_idx = Some(prev_idx);
+                            top_line = search_matches[prev_idx].saturating_sub(visible_lines / 2);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn render_annotate_page(
+    lines: &[perforce::AnnotateLine],
+    top_line: usize,
+    visible_lines: usize,
+    search_query: &Option<String>,
+    search_matches: &[usize],
+    current_match_idx: Option<usize>,
+) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    let (term_width, _) = terminal::size()?;
+    
+    execute!(stdout, cursor::MoveTo(0, 0))?;
+    
+    let end_line = (top_line + visible_lines).min(lines.len());
+    
+    // Find the max width for each column to align properly
+    let max_cl_width = lines.iter()
+        .map(|l| l.cl_number.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let max_user_width = lines.iter()
+        .map(|l| l.username.len())
+        .max()
+        .unwrap_or(10)
+        .max(10);
+    
+    for i in top_line..end_line {
+        let line = &lines[i];
+        
+        // Clear the entire line first
+        execute!(stdout, terminal::Clear(ClearType::CurrentLine))?;
+        
+        // Check if this line is a search match
+        let is_current_match = current_match_idx
+            .and_then(|idx| search_matches.get(idx))
+            .map(|&match_line| match_line == i)
+            .unwrap_or(false);
+        
+        let is_match = search_matches.contains(&i);
+        
+        // Format the line with proper column alignment
+        let formatted = format!(
+            "{:>width_cl$} {:width_user$} {} {}",
+            line.cl_number,
+            line.username,
+            line.date,
+            line.line_content,
+            width_cl = max_cl_width,
+            width_user = max_user_width,
+        );
+        
+        // Truncate to terminal width if necessary to prevent wrapping
+        // Use char-based truncation to handle Unicode properly
+        let truncated = if formatted.chars().count() > term_width as usize {
+            let mut truncated_str = formatted.chars()
+                .take(term_width as usize - 1)
+                .collect::<String>();
+            truncated_str.push('…');
+            truncated_str
+        } else {
+            formatted
+        };
+        
+        // Highlight current match or regular match
+        if is_current_match {
+            write!(stdout, "{}\r\n", truncated.black().on_yellow())?;
+        } else if is_match {
+            write!(stdout, "{}\r\n", truncated.on_bright_black())?;
+        } else {
+            write!(stdout, "{}\r\n", truncated)?;
+        }
+    }
+    
+    // Clear remaining lines
+    for _ in end_line..top_line + visible_lines {
+        execute!(stdout, terminal::Clear(ClearType::CurrentLine))?;
+        write!(stdout, "\r\n")?;
+    }
+    
+    // Status bar
+    execute!(stdout, cursor::MoveTo(0, visible_lines as u16), terminal::Clear(ClearType::CurrentLine))?;
+    let status = if let Some(ref query) = search_query {
+        if let Some(idx) = current_match_idx {
+            format!(
+                "Lines {}-{}/{} | Search: '{}' ({}/{} matches) | q:quit /:search n:next p:prev",
+                top_line + 1,
+                end_line,
+                lines.len(),
+                query,
+                idx + 1,
+                search_matches.len()
+            )
+        } else {
+            format!(
+                "Lines {}-{}/{} | Search: '{}' (no matches) | q:quit /:search",
+                top_line + 1,
+                end_line,
+                lines.len(),
+                query
+            )
+        }
+    } else {
+        format!(
+            "Lines {}-{}/{} | q:quit /:search ↑↓:scroll PgUp/PgDn:page",
+            top_line + 1,
+            end_line,
+            lines.len()
+        )
+    };
+    
+    // Pad or truncate status to fill the terminal width
+    let status_display = if status.chars().count() > term_width as usize {
+        let mut truncated = status.chars()
+            .take(term_width as usize - 1)
+            .collect::<String>();
+        truncated.push('…');
+        truncated
+    } else {
+        // Pad with spaces to fill terminal width
+        let padding = term_width as usize - status.chars().count();
+        format!("{}{}", status, " ".repeat(padding))
+    };
+    write!(stdout, "{}", status_display.black().on_white())?;
+    
+    stdout.flush()?;
+    Ok(())
+}
+
+fn prompt_search() -> Result<Option<String>> {
+    let mut stdout = std::io::stdout();
+    let (_, term_height) = terminal::size()?;
+    
+    // Show prompt at the bottom
+    execute!(stdout, cursor::MoveTo(0, term_height - 1), terminal::Clear(ClearType::CurrentLine))?;
+    write!(stdout, "/")?;
+    stdout.flush()?;
+    
+    execute!(stdout, cursor::Show)?;
+    
+    let mut query = String::new();
+    loop {
+        if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+            match code {
+                KeyCode::Enter => {
+                    execute!(stdout, cursor::Hide)?;
+                    return Ok(if query.is_empty() { None } else { Some(query) });
+                }
+                KeyCode::Esc => {
+                    execute!(stdout, cursor::Hide)?;
+                    return Ok(None);
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    execute!(stdout, cursor::MoveTo(0, term_height - 1), terminal::Clear(ClearType::CurrentLine))?;
+                    write!(stdout, "/{}", query)?;
+                    stdout.flush()?;
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    write!(stdout, "{}", c)?;
+                    stdout.flush()?;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn find_search_matches(lines: &[perforce::AnnotateLine], query: &str) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.cl_number.to_lowercase().contains(query)
+                || line.username.to_lowercase().contains(query)
+                || line.date.to_lowercase().contains(query)
+                || line.line_content.to_lowercase().contains(query)
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
