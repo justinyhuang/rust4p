@@ -56,8 +56,8 @@ enum Commands {
     #[command(name = "gdeinit")]
     Gdeinit,
     /// Manage tracked changelists.
-    #[command(name = "cls")]
-    Cls,
+    #[command(name = "ls")]
+    Ls,
     /// Show annotated file with CL, user, date, and line content.
     #[command(name = "annotate")]
     Annotate {
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
         Commands::Add { file } => cmd_add(&file)?,
         Commands::Ginit => cmd_ginit()?,
         Commands::Gdeinit => cmd_gdeinit()?,
-        Commands::Cls => cmd_cls()?,
+        Commands::Ls => cmd_ls()?,
         Commands::Annotate { file } => cmd_annotate(&file)?,
     }
     Ok(())
@@ -1385,7 +1385,7 @@ fn cmd_gdeinit() -> Result<()> {
     Ok(())
 }
 
-fn cmd_cls() -> Result<()> {
+fn cmd_ls() -> Result<()> {
     // Get tracked CLs from config
     let tracked_cls = read_tracked_cls()?;
     
@@ -1721,7 +1721,7 @@ fn interactive_cl_select_with_delete(
             std::io::stdout().flush()?;
             
             // Display header
-            print!("Tracked CLs (↑/↓ to navigate, 'd' to delete, Esc/q to cancel):\r\n\r\n");
+            print!("Tracked CLs (↑/↓ to navigate, 'd' to delete, 'u' to unshelve, Esc/q to cancel):\r\n\r\n");
             
             // Display items
             for (idx, item) in items.iter().enumerate() {
@@ -1851,6 +1851,201 @@ fn interactive_cl_select_with_delete(
                             // Re-enable raw mode and continue
                             terminal::enable_raw_mode()?;
                         }
+                    }
+                    KeyCode::Char('u') | KeyCode::Char('U') => {
+                        let cl = items[selected_idx].clone();
+                        terminal::disable_raw_mode()?;
+                        
+                        // Clear the menu
+                        execute!(
+                            std::io::stdout(),
+                            cursor::MoveTo(render_pos.0, render_pos.1),
+                            terminal::Clear(ClearType::FromCursorDown)
+                        )?;
+                        
+                        println!("Selected: CL {}", cl.bright_cyan().bold());
+                        if let Some(desc) = descriptions.get(&cl) {
+                            println!("Description: {}", desc.bright_cyan());
+                        }
+                        println!();
+                        
+                        // Get shelved files
+                        let shelved_files = perforce::get_shelved_files(&cl)?;
+                        
+                        if shelved_files.is_empty() {
+                            println!("No shelved files found in CL {}", cl);
+                            println!("\nPress any key to continue...");
+                            terminal::enable_raw_mode()?;
+                            event::read()?;
+                            continue;
+                        }
+                        
+                        // Check if CL is from a different client
+                        let cl_client = perforce::get_changelist_client(&cl)?;
+                        let current_client = perforce::get_current_client()?;
+                        
+                        let dest_cl = if cl_client.as_ref() != Some(&current_client) {
+                            let cl_client_name = cl_client.as_deref().unwrap_or("unknown");
+                            println!("{}", format!("Warning: CL {} belongs to client '{}', but you're in client '{}'.", 
+                                cl, cl_client_name, current_client).bright_yellow());
+                            println!("\nDo you want to unshelve to a different CL? (y/N):");
+                            
+                            let mut input = String::new();
+                            std::io::stdin().read_line(&mut input)?;
+                            let answer = input.trim().to_lowercase();
+                            
+                            if answer == "y" || answer == "yes" {
+                                // Get CLs without opened files
+                                let opened = perforce::get_opened_files()?;
+                                let mut cl_file_count: HashMap<String, usize> = HashMap::new();
+                                for file in &opened {
+                                    *cl_file_count.entry(file.changelist.clone()).or_insert(0) += 1;
+                                }
+                                
+                                let tracked_cls = read_tracked_cls()?;
+                                let mut empty_cls: Vec<_> = tracked_cls.iter()
+                                    .filter(|c| cl_file_count.get(*c).copied().unwrap_or(0) == 0)
+                                    .cloned()
+                                    .collect();
+                                
+                                empty_cls.sort_by(|a, b| {
+                                    match (a.parse::<i64>(), b.parse::<i64>()) {
+                                        (Ok(x), Ok(y)) => x.cmp(&y),
+                                        _ => a.cmp(b),
+                                    }
+                                });
+                                
+                                let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+                                for c in &empty_cls {
+                                    if let Ok(Some(desc)) = perforce::get_change_description(c) {
+                                        let first_line = desc.lines().next().unwrap_or("").trim();
+                                        cl_descriptions.insert(c.clone(), first_line.to_string());
+                                    }
+                                }
+                                
+                                empty_cls.push("[Create new CL]".to_string());
+                                cl_descriptions.insert("[Create new CL]".to_string(), "Create a new changelist".to_string());
+                                
+                                println!("\nSelect destination CL:");
+                                println!();
+                                
+                                if let Some(target) = interactive_select_with_desc(&empty_cls, &cl_descriptions)? {
+                                    if target == "[Create new CL]" {
+                                        let new_cl = perforce::create_changelist()?;
+                                        println!("Created new CL: {}", new_cl.bright_green());
+                                        new_cl
+                                    } else {
+                                        target
+                                    }
+                                } else {
+                                    println!("Cancelled.");
+                                    terminal::enable_raw_mode()?;
+                                    continue;
+                                }
+                            } else {
+                                cl.clone()
+                            }
+                        } else {
+                            cl.clone()
+                        };
+                        
+                        println!("\nSelect files to unshelve from CL {}:", cl);
+                        println!();
+                        
+                        // Create a simple color map
+                        let palette: Vec<fn(&str) -> String> = vec![|s| s.blue().to_string()];
+                        let mut cl_to_color: HashMap<String, fn(&str) -> String> = HashMap::new();
+                        cl_to_color.insert(cl.clone(), palette[0]);
+                        
+                        let cl_descriptions_empty: HashMap<String, String> = HashMap::new();
+                        
+                        // Interactive file selector - all files pre-selected
+                        let selected_files = interactive_file_select(&shelved_files, &cl_to_color, &cl_descriptions_empty, true)?;
+                        
+                        if selected_files.is_empty() {
+                            println!("No files selected.");
+                            terminal::enable_raw_mode()?;
+                            continue;
+                        }
+                        
+                        // Collect depot paths
+                        let file_paths: Vec<String> = selected_files.iter().map(|f| f.depot_file.clone()).collect();
+                        
+                        // Unshelve the selected files
+                        if cl == dest_cl {
+                            println!("\nUnshelving {} file(s) from CL {}...", file_paths.len(), cl);
+                            match perforce::unshelve_files(&cl, &file_paths) {
+                                Ok(_) => {
+                                    add_tracked_cl(&cl)?;
+                                    println!("✓ Successfully unshelved {} file(s) from CL {}", file_paths.len(), cl);
+                                }
+                                Err(e) => {
+                                    eprintln!("Error unshelving: {}", e);
+                                    println!("\nPress any key to continue...");
+                                    terminal::enable_raw_mode()?;
+                                    event::read()?;
+                                    continue;
+                                }
+                            }
+                            
+                            // Reopen files to the original CL
+                            if cl != "default" {
+                                println!("\nReopening files to CL {}...", cl);
+                                
+                                // Get opened files to find files in default CL that need reopening
+                                let opened = perforce::get_opened_files()?;
+                                let default_files: Vec<_> = opened
+                                    .iter()
+                                    .filter(|f| f.changelist == "default" && file_paths.contains(&f.depot_file))
+                                    .collect();
+                                
+                                for file in default_files {
+                                    let mut cmd = std::process::Command::new("p4");
+                                    cmd.arg("reopen").arg("-c").arg(&cl).arg(&file.depot_file);
+                                    
+                                    let output = cmd.output()?;
+                                    if !output.status.success() {
+                                        eprintln!("Warning: Failed to reopen {}: {}", 
+                                            file.depot_file, 
+                                            String::from_utf8_lossy(&output.stderr));
+                                    } else {
+                                        println!("  ✓ {}", file.depot_file);
+                                    }
+                                }
+                            }
+                        } else {
+                            println!("\nUnshelving {} file(s) from CL {} to CL {}...", file_paths.len(), cl, dest_cl);
+                            
+                            let mut cmd = std::process::Command::new("p4");
+                            cmd.arg("unshelve")
+                                .arg("-s")
+                                .arg(&cl)
+                                .arg("-c")
+                                .arg(&dest_cl);
+                            
+                            for file in &file_paths {
+                                cmd.arg(file);
+                            }
+                            
+                            let output = cmd.output()?;
+                            
+                            if output.status.success() {
+                                add_tracked_cl(&dest_cl)?;
+                                println!("✓ Successfully unshelved {} file(s) from CL {} to CL {}", 
+                                    file_paths.len(), cl, dest_cl);
+                            } else {
+                                eprintln!("Error unshelving:");
+                                eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+                                println!("\nPress any key to continue...");
+                                terminal::enable_raw_mode()?;
+                                event::read()?;
+                                continue;
+                            }
+                        }
+                        
+                        println!("\nPress any key to continue...");
+                        terminal::enable_raw_mode()?;
+                        event::read()?;
                     }
                     KeyCode::Esc | KeyCode::Char('q') => {
                         terminal::disable_raw_mode()?;
