@@ -136,13 +136,39 @@ fn cmd_opened() -> Result<()> {
             }
         }
     }
+    
+    // Check for file differences between opened and shelved
+    let mut cl_has_diff: HashMap<String, bool> = HashMap::new();
+    for key in &keys {
+        if key != "default" {
+            let files = map.get(key).unwrap();
+            let opened_files: std::collections::HashSet<String> = files
+                .iter()
+                .map(|f| f.depot_file.clone())
+                .collect();
+            
+            if let Ok(shelved_files) = perforce::get_shelved_files(key) {
+                let shelved_paths: std::collections::HashSet<String> = shelved_files
+                    .iter()
+                    .map(|f| f.depot_file.clone())
+                    .collect();
+                
+                if opened_files != shelved_paths {
+                    cl_has_diff.insert(key.clone(), true);
+                }
+            }
+        }
+    }
 
     // Calculate max width across all boxes first
     let mut max_width = 0usize;
     for key in &keys {
         let files = map.get(key).unwrap();
+        let has_diff = cl_has_diff.get(key).copied().unwrap_or(false);
         let title = if key == "default" {
             "CL default (pending)".to_string()
+        } else if has_diff {
+            format!("CL {} [files differ from shelved]", key)
         } else {
             format!("CL {key}")
         };
@@ -173,6 +199,8 @@ fn cmd_opened() -> Result<()> {
     let num_keys = keys.len();
     for (idx, key) in keys.iter().enumerate() {
         let files = map.get(key).unwrap();
+        let has_diff = cl_has_diff.get(key).copied().unwrap_or(false);
+        
         // Default changelist is always bright red
         let color = if key == "default" {
             |s: &str| s.bright_red().to_string()
@@ -185,6 +213,8 @@ fn cmd_opened() -> Result<()> {
 
         let title = if key == "default" {
             "CL default (pending)".to_string()
+        } else if has_diff {
+            format!("CL {} {}", key, "[files differ from shelved]".bright_yellow())
         } else {
             format!("CL {key}")
         };
@@ -193,6 +223,10 @@ fn cmd_opened() -> Result<()> {
         let is_last = idx == num_keys - 1;
         print_box(&header, description, &files.iter().map(render_opened_line).collect_vec(), color, max_width, idx > 0, is_last);
     }
+    
+    // Show hint about viewing file differences
+    println!();
+    println!("{}", "Tip: Use 'p ls' and press 's' on a CL to view file differences.".bright_black());
 
     Ok(())
 }
@@ -1431,11 +1465,40 @@ fn cmd_ls() -> Result<()> {
         }
     }
     
+    // Check if opened files differ from shelved files for each CL
+    let mut cl_has_diff: HashMap<String, bool> = HashMap::new();
+    for cl in &cls {
+        let file_count = cl_file_count.get(cl).copied().unwrap_or(0);
+        
+        // Only check if CL has opened files
+        if file_count > 0 {
+            // Get opened files for this CL
+            let opened_files: std::collections::HashSet<String> = opened
+                .iter()
+                .filter(|f| &f.changelist == cl)
+                .map(|f| f.depot_file.clone())
+                .collect();
+            
+            // Get shelved files for this CL
+            if let Ok(shelved_files) = perforce::get_shelved_files(cl) {
+                let shelved_paths: std::collections::HashSet<String> = shelved_files
+                    .iter()
+                    .map(|f| f.depot_file.clone())
+                    .collect();
+                
+                // Check if the sets differ
+                if opened_files != shelved_paths {
+                    cl_has_diff.insert(cl.clone(), true);
+                }
+            }
+        }
+    }
+    
     println!("Tracked changelists:");
     println!();
     
     // Use interactive selector with delete capability
-    match interactive_cl_select_with_delete(&cls, &cl_descriptions, &cl_file_count)? {
+    match interactive_cl_select_with_delete(&cls, &cl_descriptions, &cl_file_count, &cl_has_diff)? {
         None => {
             println!("No action taken.");
         }
@@ -1697,6 +1760,7 @@ fn interactive_cl_select_with_delete(
     items: &[String],
     descriptions: &HashMap<String, String>,
     file_counts: &HashMap<String, usize>,
+    has_diff: &HashMap<String, bool>,
 ) -> Result<Option<String>> {
     let mut selected_idx = 0usize;
     
@@ -1721,12 +1785,13 @@ fn interactive_cl_select_with_delete(
             std::io::stdout().flush()?;
             
             // Display header
-            print!("Tracked CLs (↑/↓ to navigate, 'd' to delete, 'u' to unshelve, Esc/q to cancel):\r\n\r\n");
+            print!("Tracked CLs (↑/↓ to navigate, 'd' to delete, 'u' to unshelve, 's' to show file diff, Esc/q to cancel):\r\n\r\n");
             
             // Display items
             for (idx, item) in items.iter().enumerate() {
                 let file_count = file_counts.get(item).copied().unwrap_or(0);
                 let desc = descriptions.get(item).map(|s| s.as_str()).unwrap_or("");
+                let has_file_diff = has_diff.get(item).copied().unwrap_or(false);
                 
                 let display = if file_count == 0 {
                     // Empty CL - show in gray
@@ -1737,10 +1802,17 @@ fn interactive_cl_select_with_delete(
                     }
                 } else {
                     // CL with files
-                    if desc.is_empty() {
+                    let base_text = if desc.is_empty() {
                         format!("CL {} — {} file(s)", item, file_count)
                     } else {
                         format!("CL {} - {} — {} file(s)", item, desc, file_count)
+                    };
+                    
+                    // If files differ from shelved, add indicator with only the indicator in yellow
+                    if has_file_diff {
+                        format!("{} {}", base_text, "[files differ from shelved]".bright_yellow())
+                    } else {
+                        base_text
                     }
                 };
                 
@@ -2046,6 +2118,107 @@ fn interactive_cl_select_with_delete(
                         println!("\nPress any key to continue...");
                         terminal::enable_raw_mode()?;
                         event::read()?;
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        let cl = items[selected_idx].clone();
+                        terminal::disable_raw_mode()?;
+                        
+                        // Clear the menu
+                        execute!(
+                            std::io::stdout(),
+                            cursor::MoveTo(render_pos.0, render_pos.1),
+                            terminal::Clear(ClearType::FromCursorDown)
+                        )?;
+                        
+                        println!("File diff for CL {}", cl.bright_cyan().bold());
+                        if let Some(desc) = descriptions.get(&cl) {
+                            println!("Description: {}", desc.bright_cyan());
+                        }
+                        println!();
+                        
+                        let file_count = file_counts.get(&cl).copied().unwrap_or(0);
+                        
+                        if file_count == 0 {
+                            println!("No opened files in CL {}", cl);
+                            println!("\nPress 'q' to return...");
+                            terminal::enable_raw_mode()?;
+                            loop {
+                                if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                                    if matches!(code, KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc) {
+                                        break;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        
+                        // Get opened files for this CL
+                        let opened = perforce::get_opened_files()?;
+                        let opened_files: Vec<_> = opened
+                            .iter()
+                            .filter(|f| &f.changelist == &cl)
+                            .map(|f| f.depot_file.clone())
+                            .collect();
+                        
+                        // Get shelved files for this CL
+                        let shelved_result = perforce::get_shelved_files(&cl);
+                        
+                        match shelved_result {
+                            Ok(shelved_files) => {
+                                let shelved_paths: Vec<_> = shelved_files
+                                    .iter()
+                                    .map(|f| f.depot_file.clone())
+                                    .collect();
+                                
+                                let opened_set: std::collections::HashSet<_> = opened_files.iter().collect();
+                                let shelved_set: std::collections::HashSet<_> = shelved_paths.iter().collect();
+                                
+                                // Files only in opened (not shelved)
+                                let only_opened: Vec<_> = opened_set.difference(&shelved_set).collect();
+                                
+                                // Files only in shelved (not opened)
+                                let only_shelved: Vec<_> = shelved_set.difference(&opened_set).collect();
+                                
+                                if only_opened.is_empty() && only_shelved.is_empty() {
+                                    println!("{}", "No differences - opened files match shelved files.".bright_green());
+                                } else {
+                                    if !only_opened.is_empty() {
+                                        println!("{}", "Files opened locally but not shelved:".bright_yellow().bold());
+                                        for file in &only_opened {
+                                            println!("  {} {}", "+".bright_green(), file);
+                                        }
+                                        println!();
+                                    }
+                                    
+                                    if !only_shelved.is_empty() {
+                                        println!("{}", "Files shelved but not opened locally:".bright_yellow().bold());
+                                        for file in &only_shelved {
+                                            println!("  {} {}", "-".bright_red(), file);
+                                        }
+                                        println!();
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                println!("{}", "No shelved files found in this CL.".bright_yellow());
+                                println!();
+                                println!("Opened files:");
+                                for file in &opened_files {
+                                    println!("  {}", file);
+                                }
+                                println!();
+                            }
+                        }
+                        
+                        println!("\nPress 'q' to return...");
+                        terminal::enable_raw_mode()?;
+                        loop {
+                            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                                if matches!(code, KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc) {
+                                    break;
+                                }
+                            }
+                        }
                     }
                     KeyCode::Esc | KeyCode::Char('q') => {
                         terminal::disable_raw_mode()?;
