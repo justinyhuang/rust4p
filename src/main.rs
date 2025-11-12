@@ -982,7 +982,12 @@ fn cmd_unshelve() -> Result<()> {
                 let mut all_cls: Vec<String> = map.keys().cloned().collect();
                 all_cls.sort();
                 
-                // Add "create new CL" option
+                // Add "default" if not already in the list
+                if !all_cls.contains(&"default".to_string()) {
+                    all_cls.insert(0, "default".to_string());
+                }
+                
+                // Add "create new CL" option at the beginning
                 all_cls.insert(0, "[Create new CL]".to_string());
                 
                 // Fetch descriptions
