@@ -960,8 +960,8 @@ fn cmd_unshelve() -> Result<()> {
     let current_client = perforce::get_current_client()?;
     let cl_client = perforce::get_changelist_client(&source_cl)?;
     
-    if let Some(cl_client_name) = cl_client {
-        if cl_client_name != current_client {
+    if let Some(ref cl_client_name) = cl_client {
+        if cl_client_name != &current_client {
             println!("{}", format!("\nWarning: CL {} belongs to a different client: {}", 
                 source_cl, cl_client_name).bright_yellow());
             println!("{}", format!("Your current client: {}", current_client).bright_cyan());
@@ -1053,12 +1053,14 @@ fn cmd_unshelve() -> Result<()> {
     // Collect depot paths
     let file_paths: Vec<String> = selected_files.iter().map(|f| f.depot_file.clone()).collect();
     
+    // Check if we can actually use the source CL (i.e., it belongs to current client)
+    let can_use_source_cl = cl_client.as_ref().map(|c| c == &current_client).unwrap_or(true);
+    
     // Unshelve the selected files
     if source_cl == dest_cl {
         println!("\nUnshelving {} file(s) from CL {}...", file_paths.len(), source_cl);
         match perforce::unshelve_files(&source_cl, &file_paths) {
             Ok(_) => {
-                add_tracked_cl(&source_cl)?;
                 println!("✓ Successfully unshelved {} file(s) from CL {}", file_paths.len(), source_cl);
             }
             Err(e) => {
@@ -1067,37 +1069,45 @@ fn cmd_unshelve() -> Result<()> {
             }
         }
         
-        // Reopen files to the same CL
-        println!("\nReopening unshelved files to CL {}...", source_cl);
-        
-        let opened = perforce::get_opened_files()?;
-        let default_files: Vec<_> = opened
-            .iter()
-            .filter(|f| f.changelist == "default")
-            .collect();
-        
-        if default_files.is_empty() {
-            println!("No files found in default changelist to reopen");
-            return Ok(());
-        }
-        
-        println!("Reopening {} file(s) to CL {}...", default_files.len(), source_cl);
-        
-        for file in default_files {
-            let mut cmd = std::process::Command::new("p4");
-            cmd.arg("reopen").arg("-c").arg(&source_cl).arg(&file.depot_file);
+        // Only try to reopen files if the CL belongs to current client
+        if can_use_source_cl {
+            // Reopen files to the same CL
+            println!("\nReopening unshelved files to CL {}...", source_cl);
             
-            let output = cmd.output()?;
-            if !output.status.success() {
-                eprintln!("Warning: Failed to reopen {}: {}", 
-                    file.depot_file, 
-                    String::from_utf8_lossy(&output.stderr));
-            } else {
-                println!("✓ {}", file.depot_file);
+            let opened = perforce::get_opened_files()?;
+            let default_files: Vec<_> = opened
+                .iter()
+                .filter(|f| f.changelist == "default")
+                .collect();
+            
+            if default_files.is_empty() {
+                println!("No files found in default changelist to reopen");
+                return Ok(());
             }
+            
+            println!("Reopening {} file(s) to CL {}...", default_files.len(), source_cl);
+            
+            for file in default_files {
+                let mut cmd = std::process::Command::new("p4");
+                cmd.arg("reopen").arg("-c").arg(&source_cl).arg(&file.depot_file);
+                
+                let output = cmd.output()?;
+                if !output.status.success() {
+                    eprintln!("Warning: Failed to reopen {}: {}", 
+                        file.depot_file, 
+                        String::from_utf8_lossy(&output.stderr));
+                } else {
+                    println!("✓ {}", file.depot_file);
+                }
+            }
+            
+            add_tracked_cl(&source_cl)?;
+            println!("\nDone! CL {} is ready for use.", source_cl);
+        } else {
+            // CL belongs to different client, files stay in default
+            println!("\nFiles have been unshelved to the default changelist.");
+            println!("Use 'p reopen' to move them to a changelist if needed.");
         }
-        
-        println!("\nDone! CL {} is ready for use.", source_cl);
     } else {
         // Unshelve to a different CL - need to use -c flag
         println!("\nUnshelving {} file(s) from CL {} to CL {}...", file_paths.len(), source_cl, dest_cl);
@@ -1425,94 +1435,97 @@ fn cmd_gdeinit() -> Result<()> {
 }
 
 fn cmd_ls() -> Result<()> {
-    // Get tracked CLs from config
-    let tracked_cls = read_tracked_cls()?;
-    
-    // Get currently opened files
-    let opened = perforce::get_opened_files()?;
-    
-    // Build a map of CL -> file count
-    let mut cl_file_count: HashMap<String, usize> = HashMap::new();
-    for file in &opened {
-        *cl_file_count.entry(file.changelist.clone()).or_insert(0) += 1;
-    }
-    
-    // Combine tracked CLs with currently opened CLs
-    let mut all_cls: std::collections::HashSet<String> = tracked_cls.iter().cloned().collect();
-    for cl in cl_file_count.keys() {
-        if cl != "default" {
-            all_cls.insert(cl.clone());
-        }
-    }
-    
-    let mut cls: Vec<String> = all_cls.into_iter().collect();
-    
-    // Sort: numeric ascending
-    cls.sort_by(|a, b| {
-        match (a.parse::<i64>(), b.parse::<i64>()) {
-            (Ok(x), Ok(y)) => x.cmp(&y),
-            _ => a.cmp(b),
-        }
-    });
-    
-    if cls.is_empty() {
-        println!("{}", "No tracked changelists found.".bright_yellow());
-        println!("Create, shelve, or unshelve changelists to track them.");
-        return Ok(());
-    }
-    
-    // Fetch descriptions for each CL
-    let mut cl_descriptions: HashMap<String, String> = HashMap::new();
-    for cl in &cls {
-        if let Ok(Some(desc)) = perforce::get_change_description(cl) {
-            let first_line = desc.lines().next().unwrap_or("").trim();
-            cl_descriptions.insert(cl.clone(), first_line.to_string());
-        }
-    }
-    
-    // Check if opened files differ from shelved files for each CL
-    let mut cl_has_diff: HashMap<String, bool> = HashMap::new();
-    for cl in &cls {
-        let file_count = cl_file_count.get(cl).copied().unwrap_or(0);
+    loop {
+        // Get tracked CLs from config
+        let tracked_cls = read_tracked_cls()?;
         
-        // Only check if CL has opened files
-        if file_count > 0 {
-            // Get opened files for this CL
-            let opened_files: std::collections::HashSet<String> = opened
-                .iter()
-                .filter(|f| &f.changelist == cl)
-                .map(|f| f.depot_file.clone())
-                .collect();
+        // Get currently opened files
+        let opened = perforce::get_opened_files()?;
+        
+        // Build a map of CL -> file count
+        let mut cl_file_count: HashMap<String, usize> = HashMap::new();
+        for file in &opened {
+            *cl_file_count.entry(file.changelist.clone()).or_insert(0) += 1;
+        }
+        
+        // Combine tracked CLs with currently opened CLs
+        let mut all_cls: std::collections::HashSet<String> = tracked_cls.iter().cloned().collect();
+        for cl in cl_file_count.keys() {
+            if cl != "default" {
+                all_cls.insert(cl.clone());
+            }
+        }
+        
+        let mut cls: Vec<String> = all_cls.into_iter().collect();
+        
+        // Sort: numeric ascending
+        cls.sort_by(|a, b| {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            }
+        });
+        
+        if cls.is_empty() {
+            println!("{}", "No tracked changelists found.".bright_yellow());
+            println!("Create, shelve, or unshelve changelists to track them.");
+            return Ok(());
+        }
+        
+        // Fetch descriptions for each CL
+        let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+        for cl in &cls {
+            if let Ok(Some(desc)) = perforce::get_change_description(cl) {
+                let first_line = desc.lines().next().unwrap_or("").trim();
+                cl_descriptions.insert(cl.clone(), first_line.to_string());
+            }
+        }
+        
+        // Check if opened files differ from shelved files for each CL
+        let mut cl_has_diff: HashMap<String, bool> = HashMap::new();
+        for cl in &cls {
+            let file_count = cl_file_count.get(cl).copied().unwrap_or(0);
             
-            // Get shelved files for this CL
-            if let Ok(shelved_files) = perforce::get_shelved_files(cl) {
-                let shelved_paths: std::collections::HashSet<String> = shelved_files
+            // Only check if CL has opened files
+            if file_count > 0 {
+                // Get opened files for this CL
+                let opened_files: std::collections::HashSet<String> = opened
                     .iter()
+                    .filter(|f| &f.changelist == cl)
                     .map(|f| f.depot_file.clone())
                     .collect();
                 
-                // Check if the sets differ
-                if opened_files != shelved_paths {
-                    cl_has_diff.insert(cl.clone(), true);
+                // Get shelved files for this CL
+                if let Ok(shelved_files) = perforce::get_shelved_files(cl) {
+                    let shelved_paths: std::collections::HashSet<String> = shelved_files
+                        .iter()
+                        .map(|f| f.depot_file.clone())
+                        .collect();
+                    
+                    // Check if the sets differ
+                    if opened_files != shelved_paths {
+                        cl_has_diff.insert(cl.clone(), true);
+                    }
                 }
             }
         }
-    }
-    
-    println!("Tracked changelists:");
-    println!();
-    
-    // Use interactive selector with delete capability
-    match interactive_cl_select_with_delete(&cls, &cl_descriptions, &cl_file_count, &cl_has_diff)? {
-        None => {
-            println!("No action taken.");
+        
+        println!("Tracked changelists:");
+        println!();
+        
+        // Use interactive selector with delete capability
+        match interactive_cl_select_with_delete(&cls, &cl_descriptions, &cl_file_count, &cl_has_diff)? {
+            None => {
+                // User cancelled or quit
+                return Ok(());
+            }
+            Some(_) => {
+                // A CL was deleted, loop to refresh the list
+                println!();
+                continue;
+            }
         }
-        Some(_) => {
-            // Action was already handled in the interactive selector
-        }
     }
-    
-    Ok(())
 }
 
 // Enum to represent items in the selection list
