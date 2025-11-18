@@ -390,15 +390,21 @@ fn cmd_reopen() -> Result<()> {
         return Ok(());
     }
     
-    // Get unique CLs for destination selection
-    let mut dest_cls: Vec<String> = opened
+    // Get CLs from opened files
+    let opened_cls: std::collections::HashSet<String> = opened
         .iter()
         .map(|f| f.changelist.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
         .collect();
     
-    // Sort CLs
+    // Get tracked CLs from .pconfig
+    let tracked_cls_vec = read_tracked_cls()?;
+    let tracked_cls: std::collections::HashSet<String> = tracked_cls_vec.into_iter().collect();
+    
+    // Combine opened CLs and tracked CLs
+    let all_cls: std::collections::HashSet<String> = opened_cls.union(&tracked_cls).cloned().collect();
+    
+    // Convert to Vec and sort
+    let mut dest_cls: Vec<String> = all_cls.into_iter().collect();
     dest_cls.sort_by(|a, b| {
         if a == "default" && b != "default" {
             std::cmp::Ordering::Less
@@ -411,6 +417,11 @@ fn cmd_reopen() -> Result<()> {
             }
         }
     });
+    
+    // Always include "default" if not already present
+    if !dest_cls.contains(&"default".to_string()) {
+        dest_cls.insert(0, "default".to_string());
+    }
     
     // Add "new CL" option at the end
     dest_cls.push("new".to_string());
@@ -741,10 +752,14 @@ fn cmd_open(file_path: &str) -> Result<()> {
         cls.insert(0, "default".to_string());
     }
     
+    // Add "[Create new CL]" option at the beginning
+    cls.insert(0, "[Create new CL]".to_string());
+    
     // Fetch descriptions for each CL
     let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    cl_descriptions.insert("[Create new CL]".to_string(), "Create a new changelist".to_string());
     for cl in &cls {
-        if cl != "default" {
+        if cl != "default" && cl != "[Create new CL]" {
             if let Ok(Some(desc)) = perforce::get_change_description(cl) {
                 let first_line = desc.lines().next().unwrap_or("").trim();
                 cl_descriptions.insert(cl.clone(), first_line.to_string());
@@ -755,12 +770,24 @@ fn cmd_open(file_path: &str) -> Result<()> {
     println!("Select a changelist to open the file to:");
     println!();
     
-    let selected_cl = match interactive_select_with_desc(&cls, &cl_descriptions)? {
+    let selected = match interactive_select_with_desc(&cls, &cl_descriptions)? {
         Some(cl) => cl,
         None => {
             println!("No changelist selected.");
             return Ok(());
         }
+    };
+    
+    let selected_cl = if selected == "[Create new CL]" {
+        // Create a new changelist
+        println!("\nCreating new changelist...");
+        let new_cl = perforce::create_changelist()?;
+        add_tracked_cl(&new_cl)?;
+        println!("{}", format!("✓ Created CL {}", new_cl).bright_green());
+        println!();
+        new_cl
+    } else {
+        selected
     };
     
     // Run p4 edit -c <CL> <depot_path>
@@ -822,10 +849,14 @@ fn cmd_add(file_path: &str) -> Result<()> {
         cls.insert(0, "default".to_string());
     }
     
+    // Add "[Create new CL]" option at the beginning
+    cls.insert(0, "[Create new CL]".to_string());
+    
     // Fetch descriptions for each CL
     let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    cl_descriptions.insert("[Create new CL]".to_string(), "Create a new changelist".to_string());
     for cl in &cls {
-        if cl != "default" {
+        if cl != "default" && cl != "[Create new CL]" {
             if let Ok(Some(desc)) = perforce::get_change_description(cl) {
                 let first_line = desc.lines().next().unwrap_or("").trim();
                 cl_descriptions.insert(cl.clone(), first_line.to_string());
@@ -836,12 +867,24 @@ fn cmd_add(file_path: &str) -> Result<()> {
     println!("Select a changelist to add the file to:");
     println!();
     
-    let selected_cl = match interactive_select_with_desc(&cls, &cl_descriptions)? {
+    let selected = match interactive_select_with_desc(&cls, &cl_descriptions)? {
         Some(cl) => cl,
         None => {
             println!("No changelist selected.");
             return Ok(());
         }
+    };
+    
+    let selected_cl = if selected == "[Create new CL]" {
+        // Create a new changelist
+        println!("\nCreating new changelist...");
+        let new_cl = perforce::create_changelist()?;
+        add_tracked_cl(&new_cl)?;
+        println!("{}", format!("✓ Created CL {}", new_cl).bright_green());
+        println!();
+        new_cl
+    } else {
+        selected
     };
     
     // Run p4 add -c <CL> <file_path>
