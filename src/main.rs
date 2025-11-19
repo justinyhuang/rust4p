@@ -12,6 +12,7 @@ use crossterm::{
     execute,
     terminal::{self, ClearType},
 };
+use glob::glob;
 
 /// p — tiny Perforce helper CLI
 #[derive(Parser)]
@@ -40,14 +41,14 @@ enum Commands {
     /// Open a file for edit in a specific changelist.
     #[command(name = "open")]
     Open {
-        /// Path to the file to open
-        file: String,
+        /// Path(s) to the file(s) to open (supports wildcards)
+        files: Vec<String>,
     },
     /// Add a new file to a specific changelist.
     #[command(name = "add")]
     Add {
-        /// Path to the file to add
-        file: String,
+        /// Path(s) to the file(s) to add (supports wildcards)
+        files: Vec<String>,
     },
     /// Initialize a git repository in the current directory.
     #[command(name = "ginit")]
@@ -77,8 +78,8 @@ fn main() -> Result<()> {
         Commands::Unshelve => cmd_unshelve()?,
         Commands::Shelve => cmd_shelve()?,
         Commands::Diff => cmd_diff()?,
-        Commands::Open { file } => cmd_open(&file)?,
-        Commands::Add { file } => cmd_add(&file)?,
+        Commands::Open { files } => cmd_open(&files)?,
+        Commands::Add { files } => cmd_add(&files)?,
         Commands::Ginit => cmd_ginit()?,
         Commands::Gdeinit => cmd_gdeinit()?,
         Commands::Ls => cmd_ls()?,
@@ -709,17 +710,53 @@ fn cmd_diff() -> Result<()> {
     Ok(())
 }
 
-fn cmd_open(file_path: &str) -> Result<()> {
-    // Get the depot path for the given file
-    let depot_path = match perforce::get_depot_path(file_path)? {
-        Some(path) => path,
-        None => {
-            eprintln!("Error: File '{}' is not in the Perforce workspace or doesn't exist.", file_path);
-            return Ok(());
+fn cmd_open(file_paths: &[String]) -> Result<()> {
+    if file_paths.is_empty() {
+        eprintln!("Error: No files specified");
+        return Ok(());
+    }
+    
+    // Collect all files (already expanded by shell, or use as-is)
+    let mut files: Vec<String> = Vec::new();
+    
+    for file_path in file_paths {
+        // Check if it contains glob characters
+        if file_path.contains('*') || file_path.contains('?') || file_path.contains('[') {
+            // Try to expand glob pattern
+            let mut found_any = false;
+            for entry in glob(file_path)? {
+                match entry {
+                    Ok(path) => {
+                        if path.is_file() {
+                            files.push(path.to_string_lossy().to_string());
+                            found_any = true;
+                        }
+                    }
+                    Err(e) => eprintln!("Error reading glob entry: {}", e),
+                }
+            }
+            if !found_any {
+                eprintln!("Warning: No files match pattern '{}'", file_path);
+            }
+        } else {
+            // File path already provided (likely expanded by shell)
+            if std::path::Path::new(file_path).is_file() {
+                files.push(file_path.clone());
+            } else {
+                eprintln!("Warning: File '{}' does not exist or is not a file", file_path);
+            }
         }
-    };
-
-    println!("Depot path: {}", depot_path.bright_cyan());
+    }
+    
+    if files.is_empty() {
+        eprintln!("Error: No valid files found");
+        return Ok(());
+    }
+    
+    println!("Found {} file(s):", files.len());
+    for file in &files {
+        println!("  {}", file);
+    }
     println!();
 
     // Get all open changelists
@@ -767,7 +804,7 @@ fn cmd_open(file_path: &str) -> Result<()> {
         }
     }
     
-    println!("Select a changelist to open the file to:");
+    println!("Select a changelist to open the file(s) to:");
     println!();
     
     let selected = match interactive_select_with_desc(&cls, &cl_descriptions)? {
@@ -790,33 +827,86 @@ fn cmd_open(file_path: &str) -> Result<()> {
         selected
     };
     
-    // Run p4 edit -c <CL> <depot_path>
-    let output = std::process::Command::new("p4")
-        .arg("edit")
-        .arg("-c")
-        .arg(&selected_cl)
-        .arg(&depot_path)
-        .output()?;
+    // Open all matching files
+    let mut success_count = 0;
+    let mut error_count = 0;
     
-    if output.status.success() {
-        println!("\n{}", "File opened successfully!".bright_green());
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    } else {
-        eprintln!("\n{}", "Error opening file:".bright_red());
-        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    println!("\nOpening files...");
+    for file in &files {
+        let output = std::process::Command::new("p4")
+            .arg("edit")
+            .arg("-c")
+            .arg(&selected_cl)
+            .arg(file)
+            .output()?;
+        
+        if output.status.success() {
+            println!("{} {}", "✓".bright_green(), file);
+            success_count += 1;
+        } else {
+            println!("{} {}: {}", "✗".bright_red(), file, String::from_utf8_lossy(&output.stderr).trim());
+            error_count += 1;
+        }
+    }
+    
+    println!();
+    if success_count > 0 {
+        println!("{}", format!("✓ {} file(s) opened successfully", success_count).bright_green());
+    }
+    if error_count > 0 {
+        eprintln!("{}", format!("✗ {} file(s) failed to open", error_count).bright_red());
     }
 
     Ok(())
 }
 
-fn cmd_add(file_path: &str) -> Result<()> {
-    // Check if file exists
-    if !std::path::Path::new(file_path).exists() {
-        eprintln!("Error: File '{}' does not exist.", file_path);
+fn cmd_add(file_paths: &[String]) -> Result<()> {
+    if file_paths.is_empty() {
+        eprintln!("Error: No files specified");
         return Ok(());
     }
-
-    println!("Adding file: {}", file_path.bright_cyan());
+    
+    // Collect all files (already expanded by shell, or use as-is)
+    let mut files: Vec<String> = Vec::new();
+    
+    for file_path in file_paths {
+        // Check if it contains glob characters
+        if file_path.contains('*') || file_path.contains('?') || file_path.contains('[') {
+            // Try to expand glob pattern
+            let mut found_any = false;
+            for entry in glob(file_path)? {
+                match entry {
+                    Ok(path) => {
+                        if path.is_file() {
+                            files.push(path.to_string_lossy().to_string());
+                            found_any = true;
+                        }
+                    }
+                    Err(e) => eprintln!("Error reading glob entry: {}", e),
+                }
+            }
+            if !found_any {
+                eprintln!("Warning: No files match pattern '{}'", file_path);
+            }
+        } else {
+            // File path already provided (likely expanded by shell)
+            if std::path::Path::new(file_path).is_file() {
+                files.push(file_path.clone());
+            } else {
+                eprintln!("Warning: File '{}' does not exist or is not a file", file_path);
+            }
+        }
+    }
+    
+    if files.is_empty() {
+        eprintln!("Error: No valid files found");
+        return Ok(());
+    }
+    
+    println!("Found {} file(s):", files.len());
+    for file in &files {
+        println!("  {}", file);
+    }
     println!();
 
     // Get all open changelists
@@ -864,7 +954,7 @@ fn cmd_add(file_path: &str) -> Result<()> {
         }
     }
     
-    println!("Select a changelist to add the file to:");
+    println!("Select a changelist to add the file(s) to:");
     println!();
     
     let selected = match interactive_select_with_desc(&cls, &cl_descriptions)? {
@@ -887,20 +977,34 @@ fn cmd_add(file_path: &str) -> Result<()> {
         selected
     };
     
-    // Run p4 add -c <CL> <file_path>
-    let output = std::process::Command::new("p4")
-        .arg("add")
-        .arg("-c")
-        .arg(&selected_cl)
-        .arg(file_path)
-        .output()?;
+    // Add all matching files
+    let mut success_count = 0;
+    let mut error_count = 0;
     
-    if output.status.success() {
-        println!("\n{}", "File added successfully!".bright_green());
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    } else {
-        eprintln!("\n{}", "Error adding file:".bright_red());
-        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    println!("\nAdding files...");
+    for file in &files {
+        let output = std::process::Command::new("p4")
+            .arg("add")
+            .arg("-c")
+            .arg(&selected_cl)
+            .arg(file)
+            .output()?;
+        
+        if output.status.success() {
+            println!("{} {}", "✓".bright_green(), file);
+            success_count += 1;
+        } else {
+            println!("{} {}: {}", "✗".bright_red(), file, String::from_utf8_lossy(&output.stderr).trim());
+            error_count += 1;
+        }
+    }
+    
+    println!();
+    if success_count > 0 {
+        println!("{}", format!("✓ {} file(s) added successfully", success_count).bright_green());
+    }
+    if error_count > 0 {
+        eprintln!("{}", format!("✗ {} file(s) failed to add", error_count).bright_red());
     }
 
     Ok(())
