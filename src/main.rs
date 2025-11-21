@@ -1203,6 +1203,14 @@ fn cmd_unshelve() -> Result<()> {
     // Check if we can actually use the source CL (i.e., it belongs to current client)
     let can_use_source_cl = cl_client.as_ref().map(|c| c == &current_client).unwrap_or(true);
     
+    // Get files currently in default BEFORE unshelving
+    let opened_before = perforce::get_opened_files()?;
+    let default_files_before: std::collections::HashSet<String> = opened_before
+        .iter()
+        .filter(|f| f.changelist == "default")
+        .map(|f| f.depot_file.clone())
+        .collect();
+    
     // Unshelve the selected files
     if source_cl == dest_cl {
         println!("\nUnshelving {} file(s) from CL {}...", file_paths.len(), source_cl);
@@ -1221,20 +1229,22 @@ fn cmd_unshelve() -> Result<()> {
             // Reopen files to the same CL
             println!("\nReopening unshelved files to CL {}...", source_cl);
             
-            let opened = perforce::get_opened_files()?;
-            let default_files: Vec<_> = opened
+            // Get files currently in default AFTER unshelving
+            let opened_after = perforce::get_opened_files()?;
+            let default_files_after: Vec<_> = opened_after
                 .iter()
                 .filter(|f| f.changelist == "default")
+                .filter(|f| !default_files_before.contains(&f.depot_file)) // Only new files
                 .collect();
             
-            if default_files.is_empty() {
-                println!("No files found in default changelist to reopen");
+            if default_files_after.is_empty() {
+                println!("No newly unshelved files found in default changelist to reopen");
                 return Ok(());
             }
             
-            println!("Reopening {} file(s) to CL {}...", default_files.len(), source_cl);
+            println!("Reopening {} file(s) to CL {}...", default_files_after.len(), source_cl);
             
-            for file in default_files {
+            for file in default_files_after {
                 let mut cmd = std::process::Command::new("p4");
                 cmd.arg("reopen").arg("-c").arg(&source_cl).arg(&file.depot_file);
                 
@@ -1749,7 +1759,7 @@ fn interactive_file_select(
             std::io::stdout().flush()?;
             
             // Display header
-            print!("Select files or CLs (↑/↓ to navigate, Space to toggle, Enter to confirm, Esc/q to cancel):\r\n\r\n");
+            print!("Select files or CLs (↑/↓ to navigate, Tab to jump to next CL, Space to toggle, Enter to confirm, Esc/q to cancel):\r\n\r\n");
             
             // Display items
             for (idx, item) in items.iter().enumerate() {
@@ -1852,6 +1862,46 @@ fn interactive_file_select(
                         } else {
                             // Wrap to top
                             selected_idx = 0;
+                        }
+                    }
+                    KeyCode::Tab => {
+                        // Jump to the next CL header
+                        let mut found_next = false;
+                        for i in (selected_idx + 1)..items.len() {
+                            if matches!(items[i], SelectItem::ClHeader(_)) {
+                                selected_idx = i;
+                                found_next = true;
+                                break;
+                            }
+                        }
+                        // If no CL found after current position, wrap to first CL
+                        if !found_next {
+                            for i in 0..=selected_idx {
+                                if matches!(items[i], SelectItem::ClHeader(_)) {
+                                    selected_idx = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::BackTab => {
+                        // Jump to the previous CL header (Shift+Tab)
+                        let mut found_prev = false;
+                        for i in (0..selected_idx).rev() {
+                            if matches!(items[i], SelectItem::ClHeader(_)) {
+                                selected_idx = i;
+                                found_prev = true;
+                                break;
+                            }
+                        }
+                        // If no CL found before current position, wrap to last CL
+                        if !found_prev {
+                            for i in (selected_idx..items.len()).rev() {
+                                if matches!(items[i], SelectItem::ClHeader(_)) {
+                                    selected_idx = i;
+                                    break;
+                                }
+                            }
                         }
                     }
                     KeyCode::Char(' ') => {
