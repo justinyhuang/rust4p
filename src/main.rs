@@ -13,6 +13,10 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use glob::glob;
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use flate2::read::GzDecoder;
+use tar::{Builder, Archive};
 
 /// p — tiny Perforce helper CLI
 #[derive(Parser)]
@@ -65,6 +69,18 @@ enum Commands {
         /// Path to the file to annotate
         file: String,
     },
+    /// Pack opened files into a compressed archive.
+    #[command(name = "pack")]
+    Pack {
+        /// Path where the archive should be saved (e.g., /tmp/backup.tar.gz)
+        output: String,
+    },
+    /// Unpack files from an archive to the current workspace.
+    #[command(name = "unpack")]
+    Unpack {
+        /// Path to the archive file to unpack (e.g., /tmp/backup.tar.gz)
+        input: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -84,6 +100,8 @@ fn main() -> Result<()> {
         Commands::Gdeinit => cmd_gdeinit()?,
         Commands::Ls => cmd_ls()?,
         Commands::Annotate { file } => cmd_annotate(&file)?,
+        Commands::Pack { output } => cmd_pack(&output)?,
+        Commands::Unpack { input } => cmd_unpack(&input)?,
     }
     Ok(())
 }
@@ -2750,6 +2768,241 @@ fn cmd_annotate(file_path: &str) -> Result<()> {
     terminal::disable_raw_mode()?;
     
     result
+}
+
+fn cmd_pack(output_path: &str) -> Result<()> {
+    // Get all opened files
+    let opened = perforce::get_opened_files()?;
+    
+    if opened.is_empty() {
+        println!("No opened files to pack.");
+        return Ok(());
+    }
+    
+    // Assign colors to changelists
+    let palette: Vec<fn(&str) -> String> = vec![
+        |s| s.blue().to_string(),
+        |s| s.green().to_string(),
+        |s| s.yellow().to_string(),
+        |s| s.magenta().to_string(),
+        |s| s.cyan().to_string(),
+        |s| s.bright_blue().to_string(),
+        |s| s.bright_green().to_string(),
+        |s| s.bright_yellow().to_string(),
+        |s| s.bright_magenta().to_string(),
+        |s| s.bright_cyan().to_string(),
+    ];
+    
+    let mut cl_to_color: HashMap<String, fn(&str) -> String> = HashMap::new();
+    let unique_cls: Vec<String> = opened
+        .iter()
+        .map(|f| f.changelist.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    
+    for (i, cl) in unique_cls.iter().enumerate() {
+        cl_to_color.insert(cl.clone(), palette[i % palette.len()]);
+    }
+    
+    // Fetch descriptions for each CL
+    let mut cl_descriptions: HashMap<String, String> = HashMap::new();
+    for cl in &unique_cls {
+        if cl != "default" {
+            if let Ok(Some(desc)) = perforce::get_change_description(cl) {
+                let first_line = desc.lines().next().unwrap_or("").trim();
+                cl_descriptions.insert(cl.clone(), first_line.to_string());
+            }
+        }
+    }
+    
+    // Interactive file selection
+    println!("Select files to pack:");
+    println!();
+    
+    let selected_files = interactive_file_select(&opened, &cl_to_color, &cl_descriptions, true)?;
+    
+    if selected_files.is_empty() {
+        println!("No files selected.");
+        return Ok(());
+    }
+    
+    println!();
+    println!("Selected {} file(s) to pack.", selected_files.len());
+    println!();
+    
+    // Create the tar.gz file
+    println!("Creating archive at '{}'...", output_path);
+    println!();
+    
+    let tar_gz_file = std::fs::File::create(output_path)?;
+    let enc = GzEncoder::new(tar_gz_file, Compression::default());
+    let mut tar = Builder::new(enc);
+    
+    // Convert depot paths to local paths and add to archive
+    let mut success_count = 0;
+    let mut error_count = 0;
+    
+    for file in &selected_files {
+        // Get local path for this depot file
+        match perforce::get_local_path(&file.depot_file)? {
+            Some(local_path) => {
+                // Check if file exists
+                let path = std::path::Path::new(&local_path);
+                if path.exists() {
+                    // Add to archive with relative path (strip leading /)
+                    let archive_path = local_path.trim_start_matches('/');
+                    match tar.append_path_with_name(&local_path, archive_path) {
+                        Ok(_) => {
+                            println!("{} {}", "✓".bright_green(), file.depot_file);
+                            success_count += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("{} {}: {}", "✗".bright_red(), file.depot_file, e);
+                            error_count += 1;
+                        }
+                    }
+                } else {
+                    eprintln!("{} {}: local file not found", "✗".bright_red(), file.depot_file);
+                    error_count += 1;
+                }
+            }
+            None => {
+                eprintln!("{} {}: could not determine local path", "✗".bright_red(), file.depot_file);
+                error_count += 1;
+            }
+        }
+    }
+    
+    // Finish the archive
+    tar.finish()?;
+    
+    println!();
+    if success_count > 0 {
+        println!("{}", format!("✓ {} file(s) packed successfully", success_count).bright_green());
+    }
+    if error_count > 0 {
+        eprintln!("{}", format!("✗ {} file(s) failed to pack", error_count).bright_red());
+    }
+    
+    println!();
+    println!("Archive saved to: {}", output_path);
+    
+    // Show file size
+    if let Ok(metadata) = std::fs::metadata(output_path) {
+        let size_kb = metadata.len() / 1024;
+        println!("Archive size: {} KB", size_kb);
+    }
+    
+    Ok(())
+}
+
+fn cmd_unpack(input_path: &str) -> Result<()> {
+    // Check if archive exists
+    if !std::path::Path::new(input_path).exists() {
+        eprintln!("Error: Archive file '{}' not found", input_path);
+        return Ok(());
+    }
+    
+    // Show archive info
+    if let Ok(metadata) = std::fs::metadata(input_path) {
+        let size_kb = metadata.len() / 1024;
+        println!("Archive: {} ({} KB)", input_path, size_kb);
+    }
+    
+    // Open and read the archive to list files
+    println!("\nListing files in archive...");
+    println!();
+    
+    let tar_gz = std::fs::File::open(input_path)?;
+    let tar = GzDecoder::new(tar_gz);
+    let mut archive = Archive::new(tar);
+    
+    let mut file_list = Vec::new();
+    for entry in archive.entries()? {
+        let entry = entry?;
+        if let Ok(path) = entry.path() {
+            file_list.push(path.to_string_lossy().to_string());
+        }
+    }
+    
+    if file_list.is_empty() {
+        println!("Archive is empty.");
+        return Ok(());
+    }
+    
+    // Display files in archive
+    println!("Files in archive ({} total):", file_list.len());
+    for file in &file_list {
+        println!("  {}", file);
+    }
+    
+    println!();
+    println!("Extract these files to the current workspace? (y/n)");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let response = input.trim().to_lowercase();
+    
+    if response != "y" && response != "yes" {
+        println!("Cancelled.");
+        return Ok(());
+    }
+    
+    // Extract files
+    println!("\nExtracting files...");
+    
+    let tar_gz = std::fs::File::open(input_path)?;
+    let tar = GzDecoder::new(tar_gz);
+    let mut archive = Archive::new(tar);
+    
+    let mut success_count = 0;
+    let mut error_count = 0;
+    
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_path_buf();
+        
+        // Extract to root (prepend /)
+        let target_path = std::path::Path::new("/").join(&path);
+        
+        // Create parent directories if needed
+        if let Some(parent) = target_path.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("{} {}: failed to create directory: {}", 
+                        "✗".bright_red(), path.display(), e);
+                    error_count += 1;
+                    continue;
+                }
+            }
+        }
+        
+        // Extract the file
+        match entry.unpack(&target_path) {
+            Ok(_) => {
+                println!("{} {}", "✓".bright_green(), target_path.display());
+                success_count += 1;
+            }
+            Err(e) => {
+                eprintln!("{} {}: {}", "✗".bright_red(), target_path.display(), e);
+                error_count += 1;
+            }
+        }
+    }
+    
+    println!();
+    if success_count > 0 {
+        println!("{}", format!("✓ {} file(s) extracted successfully", success_count).bright_green());
+    }
+    if error_count > 0 {
+        eprintln!("{}", format!("✗ {} file(s) failed to extract", error_count).bright_red());
+    }
+    
+    println!();
+    println!("Files have been extracted to the workspace.");
+    println!("You may need to run 'p4 edit' or 'p4 add' to open them in Perforce.");
+    
+    Ok(())
 }
 
 fn annotate_viewer(lines: &[perforce::AnnotateLine]) -> Result<()> {

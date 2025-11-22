@@ -367,6 +367,39 @@ pub fn get_depot_path(local_path: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Get the local path for a depot file using p4 where
+pub fn get_local_path(depot_path: &str) -> Result<Option<String>> {
+    let output = Command::new("p4")
+        .arg("where")
+        .arg(depot_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to run p4 where on {}", depot_path))?;
+    
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    if stderr.contains("not in client view") || stderr.contains("file(s) not in client view") {
+        return Ok(None);
+    }
+    
+    if !output.status.success() {
+        return Ok(None);
+    }
+    
+    // Parse output: depot-path client-path local-path
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 {
+            // The third field is the local path
+            return Ok(Some(parts[2].to_string()));
+        }
+    }
+    
+    Ok(None)
+}
+
 #[derive(Debug, Clone)]
 pub struct AnnotateLine {
     pub cl_number: String,
